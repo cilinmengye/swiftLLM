@@ -43,4 +43,6 @@ class LlamaModelConfig:
     def load_from_model_path(model_path: str) -> "LlamaModelConfig":
         with open(os.path.join(model_path, "config.json"), "r", encoding="utf-8") as f:
             model_config_dict = json.loads(f.read())
+        # model_config_dict is dict read from model config.json
+        # print(model_config_dict)
         return LlamaModelConfig(model_config_dict)

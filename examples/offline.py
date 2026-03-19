@@ -19,7 +19,7 @@ if __name__ == '__main__':
 
     engine_config = swiftllm.EngineConfig(
         model_path = model_path,
-        use_dummy = False,
+        use_dummy = False,          # use_dummy == True, 那么在加载权重时会随机生成权重，而不是正经从safetensor文件中加载
         
         block_size = 16,
         gpu_mem_utilization = 0.99,
@@ -57,6 +57,8 @@ if __name__ == '__main__':
 
     # Prompt phase
     input_ids = tokenizer(prompts)['input_ids']
+    # input_ids is list[list]
+    # print(input_ids)
     prompt_phase_outputs = model.forward(
         input_ids,
         list(range(0, len(prompts))),

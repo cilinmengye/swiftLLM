@@ -21,13 +21,18 @@ class LlamaPostLayer:
         infer_state: LlamaInferState
     ) -> torch.Tensor:
         # Slice to get the last token embedding for each request
+        # 如下代码主要目的为取出 flatten request 中每个request中最后一个token进行RMS NORM and lm_head, sampler
         last_token_indices = torch.cat(
             (
+                # infer_state.prefill_seq_start_locs 为 [b*s, *] 中 prefill request 在这种 flatten request 的下标
+                # infer_state.prefill_seq_start_locs + infer_state.prefill_seq_lens - 1 求得  prefill request 最后一个token 在这种 flatten request 的下标
+                # torch.arange(infer_state.num_prefill_tokens, infer_state.num_tokens) 求得 decode request 最后一个token 在这种 flatten request 的下标
                 infer_state.prefill_seq_start_locs + infer_state.prefill_seq_lens - 1,
                 torch.arange(infer_state.num_prefill_tokens, infer_state.num_tokens, device=input_embds.device, dtype=torch.int32)
             ), dim=0
         )
         last_input = torch.empty((infer_state.batch_size, self.model_config.hidden_size), device=input_embds.device, dtype=input_embds.dtype)
+        # 注意此处 last_token_indices shape[0] == infer_state.batch_size
         last_input[:, :] = input_embds[last_token_indices, :]
         # Apply RMS-norm
         rmsnorm_inplace(

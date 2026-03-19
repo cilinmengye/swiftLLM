@@ -43,6 +43,9 @@ class LlamaTransformerLayer:
         # After: input_embds will be RMSNorm(input_embds + residual_buf), and
         #        residual_buf will be input_embds + residual_buf (which will be
         #        used as the residual after the attention block)
+        # 即fused_add_rmsnorm_inplace 融合了 residual add 和 rmsnorm 操作
+        # residual_buf 为提前开辟的显存空间，可以避免 residual tensor 频繁地分配、释放
+        # 其核心操作为： input_embds =  RMSNorm(input_embds + residual_buf); residual_buf = input_embds + residual_buf
         fused_add_rmsnorm_inplace(
             input_embds,
             residual_buf,
@@ -65,6 +68,14 @@ class LlamaTransformerLayer:
             infer_state
         )
 
+        # 注意我们开创了两个CUDA Stream: 1. torch 默认的CUDA Stream, 
+        # 2. decoding_piggyback_stream CUDA Stream
+        # 当我们没有指定使用何种Stream时，会默认使用 default cuda stream
+        # 所以接下来的 store_kcache 和 针对prefill request的flash attention都是在default cuda stream
+        # 针对decode request的page attention在我们手动创建的decoding_piggyback_stream CUDA Stream
+        # 不同Stream上的CUDA kernel是并发地，即GPU在执行其中一个cuda kernel时会利用剩余的资源启动另一个CUDA kernel
+        # 我们将default cuda stream 类比为主干道: store_kvcache , flash attention 在主干道上串行
+        # decoding_piggyback_stream 类比为次干道: page attention 在次干道上执行，但是其必须等待store_kvcache执行完毕
         if not infer_state.ignore_kvcache:
             store_kvcache(
                 k, v,
@@ -102,6 +113,7 @@ class LlamaTransformerLayer:
             assert not infer_state.ignore_kvcache
             with torch.cuda.stream(self.decoding_piggyback_stream):
                 torch.cuda.current_stream().wait_event(store_kvcache_event)
+                #  前 num_prefill_tokens 行是 prefill 序列的 query，切片后只留解码 query
                 paged_attention(
                     q[infer_state.num_prefill_tokens:, :, :],
                     k_cache, v_cache, block_table,

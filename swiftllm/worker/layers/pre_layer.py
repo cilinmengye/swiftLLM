@@ -16,6 +16,8 @@ class LlamaPreLayer:
         self,
         input_ids: torch.Tensor
     ) -> torch.Tensor:
+        # 因为已经有tensor的weight，即self.weights.wte，所以不使用nn.Embedding
+        # 因为nn.Embedding会内部自带 self.weight，如果使用nn.Embedding，那么我还需要将weight copy一下
         input_embdings = torch.embedding(self.weights.wte, input_ids, padding_idx=-1)
         return input_embdings
     

@@ -19,6 +19,8 @@ class EngineConfig:
     max_blocks_per_seq: int
 
     # Scheduling-related parameters
+    # 就获取剩余可用KV Cache Size而言，刚需知道如下两个参数
+    # 因为需要模拟运行一遍以最大负荷执行的Prefill，获得模型推理时整个显存最大剩余显存
     max_batch_size: int
     max_tokens_in_batch: int
 

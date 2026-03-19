@@ -3,16 +3,17 @@ from torch.utils import cpp_extension
 
 __version__ = "0.0.1"
 
+# 把 C++/CUDA 源代码编译成一个可以被 Python import 的动态链接库（.so 文件）。
 ext_modules = [
     cpp_extension.CUDAExtension(
-        "swiftllm_c",
-        [
+        "swiftllm_c",               # ① 模块名
+        [                           # ② 源文件列表
             "src/entrypoints.cpp",
 			"src/block_swapping.cpp"
         ],
-        extra_compile_args={
-            'cxx': ['-O3'],
-            'nvcc': ['-O3', '--use_fast_math']
+        extra_compile_args={        # ③ 编译参数
+            'cxx': ['-O3'],                     # 给 C++ 编译器的参数
+            'nvcc': ['-O3', '--use_fast_math']  # 给 CUDA 编译器的参数
         }
     ),
 ]

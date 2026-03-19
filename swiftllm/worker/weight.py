@@ -41,6 +41,7 @@ class WeightBase:
         """
         Load weights
         """
+        # 此处 getter 返回 tensor
         for item in self.registered_weights:
             weight_value = getter(item)
             assert weight_value is not None, f"getter() returned None for {item.key} ({item})"

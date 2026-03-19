@@ -37,7 +37,7 @@ class LlamaModel:
         """
         Initialize the LlamaModel.
         """
-        self.engine_config = engine_config
+        self.engine_config = engine_config  # EngineConfig data class
 
         # Load model config
         self.model_config = LlamaModelConfig.load_from_model_path(engine_config.model_path)
@@ -47,9 +47,9 @@ class LlamaModel:
         self._cos_cached = self._sin_cached = None
 
         # Layers
-        self.pre_layer = None
-        self.transformer_layers = None
-        self.post_layer = None
+        self.pre_layer = None           # 包含 embedding token layer逻辑
+        self.transformer_layers = None  # 包含 Decoder layer逻辑
+        self.post_layer = None          # 包含 最后一次的 norm layer 和 lm_head, sampler 逻辑
 
         # KV Cache
         self.num_blocks = None
@@ -214,11 +214,11 @@ class LlamaModel:
             freqs = torch.cat([freqs_low, freqs_high], dim=-1)
         else:
             # Original implementation for scalar rope_scaling
-            rope_scaling_factor = rope_scaling
-            max_seq_len = max_position_embeddings * rope_scaling_factor
+            rope_scaling_factor = rope_scaling      # 标量，比如 1.0 或 2.0，表示支持扩展的序列长度的大小
+            max_seq_len = max_position_embeddings * rope_scaling_factor     # 支持的最大序列长度， max_position_embeddings 为原始预训练时支持的序列长度
 
             inv_freq = 1.0 / (base ** (torch.arange(0, self.model_config.head_dim, 2, device="cuda", dtype=torch.float32) / self.model_config.head_dim))
-            t = torch.arange(max_seq_len + 128, device="cuda", dtype=torch.float32) / rope_scaling_factor
+            t = torch.arange(max_seq_len + 128, device="cuda", dtype=torch.float32) / rope_scaling_factor       # t 决定缓存表实际有多少行（能覆盖多长的序列）， / rope_scaling_factor 目的是将长度缩放回原来的预训练序列长度
             freqs = torch.outer(t, inv_freq)
 
         self._cos_cached = torch.cos(freqs).to(torch.float16)
@@ -264,9 +264,15 @@ class LlamaModel:
 
         This function is intended to be called by the server.
         """
+        # input_ids_list 混合着 Prefill 和 Decode 的 Input ids, 且前部分是Prefill, 后部分是Decode
+        # seq_ids_list 含义为 request sequence 在 request lists 中的下标
+        # decoding_seq_lens_list 为当前decode requests已经生成序列长度
 
+        # 计算 Prefill（新请求）的数量
         num_prefill_seqs = len(input_ids_list) - len(decoding_seq_lens_list)
+        # 将每个请求在打平
         flattened_input_ids = list(itertools.chain(*input_ids_list))
+        # 汇总每个序列的长度：Prefill 算实际长度，Decoding 算当前已生成的长度
         seq_lengths_list = [len(seq) for seq in input_ids_list[:num_prefill_seqs]] + decoding_seq_lens_list
 
         seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
@@ -275,14 +281,22 @@ class LlamaModel:
         batch_size = len(input_ids_list)
         num_tokens = len(flattened_input_ids)
 
+        # 取出 Prefill request 长度
         prefill_seq_lens_list = seq_lengths_list[:num_prefill_seqs]
         prefill_seq_lens = torch.tensor(prefill_seq_lens_list, dtype=torch.int32, device="cuda")
+        # cumsum 是累加和，用来计算每个请求在打平后的 Tensor 中的起始位置
         prefill_start_locs = torch.cumsum(prefill_seq_lens, dim=0, dtype=torch.int32) - prefill_seq_lens
         max_prefill_len = max(prefill_seq_lens_list) if prefill_seq_lens_list else 0
 
         decoding_seq_lens = torch.tensor(decoding_seq_lens_list, dtype=torch.int32, device="cuda")
         max_decoding_len = max(decoding_seq_lens_list) if decoding_seq_lens_list else 0
 
+        # 让模型知道每个 token 的顺序
+        # 对于 prefill request 生成的是 [0,.., prefill_len - 1]
+        # 对于 decode request 生成的是 [decode_len - 1]
+        # 最后将其拼成一个一维tensor
+        # 例如 [0, 1, 2, 0, 1, 5]，我就可知道其有三个request，2个prefill request, 1个decode request
+        # [0, 1, 2], [0, 1], [5] 其作用主要在于RoPE
         position_indices = torch.cat((
             torch.concat([
                 torch.arange(
@@ -317,6 +331,18 @@ class LlamaModel:
         # In practice, we use `decoding_seq_lens_sum/seq_block_size` to approximate
         # sum(cdiv(decoding_seq_lens, seq_block_size))
 
+        # 从如下代码中可以窥见作者实现 Page attention 的思路
+        # 作者启动 CUDA kernel :  (num_decoding_seqs, num_kv_heads, cdiv(max_decoding_len, seq_block_size))
+        # 先来说明下为什么是 num_kv_heads, 而不是 num_attention_heads: 作者的观点：内存受限（Memory-Bound）下的工程优化
+        # 在GQA的推理 Decoding 阶段，模型是极其吃显存带宽的。加载 KV Cache 的开销远大于计算本身的开销
+        # 如果设置为 num_attention_heads 那么依赖相同KV Head的 thread block 会各自去显存里读取同一份 KV Cache 块
+        # 但是如果设置为 num_kv_heads，thread block 只需要加载一份KV Cache, 处理多个Q HEAD
+        # 所以上述CUDA kernel, 每个 thread block 处理 num_attention_head // num_kv_head 个 Q HEAD 中一份 kv cache block 的 attention
+        
+        # 作者如下代码的目的是为了 选择出最佳的seq_block_size, 因为其决定了CUDA kernel启动时有多少thread block, 我们thread block需要 >= GPU SM number 以最大利用计算资源
+        # 同时 我们要保证 seq_block_size 不能太小，需要保证 thread block 中的计算量充足，而且要保证在 Page attention phase 2 压力不会过大
+        # (Phase 1：每个 Block 计算自己负责的那一小段 KV Cache 的 Attention 分数，得到一个局部结果。
+        # (Phase 2 (Reduction)：将同一个decode request局部结果合并（LogSumExp 累加）成最终的输出。)
         seq_block_size = 2048
         decoding_seq_lens_sum = sum(decoding_seq_lens_list)
         while self.model_config.num_kv_heads*(decoding_seq_lens_sum/seq_block_size) < 1024 and seq_block_size//2 >= 64 and \
