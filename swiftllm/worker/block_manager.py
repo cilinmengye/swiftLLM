@@ -72,6 +72,7 @@ class BlockManager:
                 seq_ids: {seq_ids}, target_lens: {target_lens}, target_num_blocks: {target_num_blocks},
                 self.num_seq_allocated_blocks[seq_ids]: {self.num_seq_allocated_blocks[seq_ids]}"""
         block_needed = target_num_blocks - self.num_seq_allocated_blocks[seq_ids]
+        # print(f"[INFO] allocate_blocks_for_seqs: per sequence needed block num {block_needed}")
         new_blocks = self._allocate_blocks(torch.sum(block_needed).item())
 
         set_block_table_and_num_seq_alloc_blocks(self.num_seq_allocated_blocks, self.block_table, new_blocks, seq_ids, block_needed)

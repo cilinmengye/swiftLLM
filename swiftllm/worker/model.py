@@ -112,6 +112,7 @@ class LlamaModel:
             for input_len in input_lens
         ]
         seq_ids = list(range(batch_size))
+        print(f"[Model.profile] profile num block in batch size {batch_size} and input len {input_lens[0]}")
         self.k_cache = self.v_cache = None # pylint: disable=attribute-defined-outside-init
         _ = self.forward(input_ids, seq_ids, [], ignore_kvcache=True)
         torch.cuda.synchronize()
@@ -126,6 +127,11 @@ class LlamaModel:
             raise RuntimeError(f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB ({total_memory/GB:.2f} GB * {self.engine_config.gpu_mem_utilization})")
         block_size_bytes = self.engine_config.block_size * self.model_config.get_kvslot_size()
         num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
+
+        target_num_blocks = [(input_len + self.engine_config.block_size - 1) // self.engine_config.block_size for input_len in input_lens]
+        print(f"[Model.profile] Available GPU block {num_gpu_blocks} " \
+              f"and least needed GPU block for batch size {batch_size}, input len {input_lens[0]} " \
+              f"is {sum(target_num_blocks)}")
 
         torch.cuda.empty_cache()
         return num_gpu_blocks
