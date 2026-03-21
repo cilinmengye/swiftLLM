@@ -115,28 +115,17 @@ Here we use the [ShareGPT](https://huggingface.co/datasets/anon8231489123/ShareG
 It can be seen that on A100 80G PCIE, SwiftLLM can achieve equivalent performance to vLLM, while on RTX 4090, SwiftLLM significantly outperforms vLLM (mainly because of that our control plane has a lower overhead).
 
 # Environment Setup
-python -m venv swift_env
-source swift_env/bin/activate
 
-1. 升级基础工具（防止安装报错）
-python -m pip install --upgrade pip setuptools
+*start up*: `python -m venv swift_env`; `source swift_env/bin/activate`
 
-2. 安装 PyTorch
-pip install torch==2.4.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-安装完成后，请务必运行以下代码确认 PyTorch 能否识别你的显卡：
-python -c "import torch; print(f'Torch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU device: {torch.cuda.get_device_name(0)}')"
-
-3. 安装编译依赖
-pip install packaging ninja
-
-4. pip install -r requirements.txt
-    1. 如果报错了说找不到torch 在编译flash_attn时，那么就尝试下 第五步
-
-5. pip install flash_attn>=2.5.8 --no-build-isolation
-    1. 然后再尝试下pip install -r requirements.txt
-
-6. pip install -e .
-
-7. pip install -e csrc
-
+1. 升级基础工具（防止安装报错）`python -m pip install --upgrade pip setuptools`
+2. 安装 PyTorch `pip install torch==2.4.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124`
+    安装完成后，请务必运行以下代码确认 PyTorch 能否识别你的显卡：`python -c "import torch; print(f'Torch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU device: {torch.cuda.get_device_name(0)}')"`
+3. 安装编译依赖 `pip install packaging ninja`
+4. `pip install -r requirements.txt`
+    1. 如果报错了说找不到 torch 在编译 flash_attn 时，那么就尝试下第五步
+5. `pip install flash_attn>=2.5.8 --no-build-isolation`
+    1. 然后再尝试下`pip install -r requirements.txt`
+6. `pip install -e .`
+7. `pip install -e csrc`
 [相关环境创建的交谈](https://gemini.google.com/share/9a07dd1e9c3d)
