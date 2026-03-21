@@ -50,16 +50,16 @@ class BenchmarkResult:
     batch_size: int
     input_len: int
     total_tokens: int
-    prefill_ms_mean: float
-    prefill_ms_std: float
-    decode_ms_mean: float
-    decode_ms_std: float
+    prefill_s_mean: float
+    prefill_s_std: float
+    decode_s_mean: float
+    decode_s_std: float
     prefill_tokens_per_s: float
     decode_tokens_per_s: float
     warmup_runs: int
     measure_runs: int
-    prefill_samples_ms: list[float]
-    decode_samples_ms: list[float]
+    prefill_samples_s: list[float]
+    decode_samples_s: list[float]
 
 
 RUNNER_PATH = Path(__file__).resolve().with_name("benchmark_case.py")
@@ -173,7 +173,7 @@ def time_prefill(model: swiftllm.LlamaModel, input_ids: list[list[int]], seq_ids
     try:
         model.forward(input_ids, seq_ids, [])
         torch.cuda.synchronize()
-        return (time.perf_counter() - started_at) * 1000
+        return (time.perf_counter() - started_at)
     finally:
         model.free_seqs_resources(seq_ids)
 
@@ -190,7 +190,7 @@ def time_decode(
         started_at = time.perf_counter()
         model.forward([[token] for token in last_tokens], seq_ids, [input_len + 1] * len(seq_ids))
         torch.cuda.synchronize()
-        return (time.perf_counter() - started_at) * 1000
+        return (time.perf_counter() - started_at)
     finally:
         model.free_seqs_resources(seq_ids)
 
@@ -214,24 +214,24 @@ def benchmark_case(
         time_decode(model, input_ids, seq_ids, case.input_len)
     decode_samples = [time_decode(model, input_ids, seq_ids, case.input_len) for _ in range(measure_runs)]
 
-    prefill_ms_mean, prefill_ms_std = summarize_samples(prefill_samples)
-    decode_ms_mean, decode_ms_std = summarize_samples(decode_samples)
+    prefill_s_mean, prefill_s_std = summarize_samples(prefill_samples)
+    decode_s_mean, decode_s_std = summarize_samples(decode_samples)
     total_tokens = case.batch_size * case.input_len
 
     return BenchmarkResult(
         batch_size=case.batch_size,
         input_len=case.input_len,
         total_tokens=total_tokens,
-        prefill_ms_mean=prefill_ms_mean,
-        prefill_ms_std=prefill_ms_std,
-        decode_ms_mean=decode_ms_mean,
-        decode_ms_std=decode_ms_std,
-        prefill_tokens_per_s=total_tokens / (prefill_ms_mean / 1000.0),
-        decode_tokens_per_s=case.batch_size / (decode_ms_mean / 1000.0),
+        prefill_s_mean=prefill_s_mean,
+        prefill_s_std=prefill_s_std,
+        decode_s_mean=decode_s_mean,
+        decode_s_std=decode_s_std,
+        prefill_tokens_per_s=total_tokens / (prefill_s_mean),
+        decode_tokens_per_s=case.batch_size / (decode_s_mean),
         warmup_runs=warmup_runs,
         measure_runs=measure_runs,
-        prefill_samples_ms=prefill_samples,
-        decode_samples_ms=decode_samples,
+        prefill_samples_s=prefill_samples,
+        decode_samples_s=decode_samples,
     )
 
 
@@ -253,7 +253,7 @@ def benchmark_single_case(
     )
     print(
         f"batch_size={result.batch_size} input_len={result.input_len} "
-        f"prefill_ms={result.prefill_ms_mean:.3f} decode_ms={result.decode_ms_mean:.3f}"
+        f"prefill_ms={result.prefill_s_mean:.3f} decode_ms={result.decode_s_mean:.3f}"
     )
     return result
 
@@ -263,16 +263,16 @@ def benchmark_result_from_dict(payload: dict) -> BenchmarkResult:
         batch_size=int(payload["batch_size"]),
         input_len=int(payload["input_len"]),
         total_tokens=int(payload["total_tokens"]),
-        prefill_ms_mean=float(payload["prefill_ms_mean"]),
-        prefill_ms_std=float(payload["prefill_ms_std"]),
-        decode_ms_mean=float(payload["decode_ms_mean"]),
-        decode_ms_std=float(payload["decode_ms_std"]),
+        prefill_s_mean=float(payload["prefill_s_mean"]),
+        prefill_s_std=float(payload["prefill_s_std"]),
+        decode_s_mean=float(payload["decode_s_mean"]),
+        decode_s_std=float(payload["decode_s_std"]),
         prefill_tokens_per_s=float(payload["prefill_tokens_per_s"]),
         decode_tokens_per_s=float(payload["decode_tokens_per_s"]),
         warmup_runs=int(payload["warmup_runs"]),
         measure_runs=int(payload["measure_runs"]),
-        prefill_samples_ms=[float(value) for value in payload["prefill_samples_ms"]],
-        decode_samples_ms=[float(value) for value in payload["decode_samples_ms"]],
+        prefill_samples_s=[float(value) for value in payload["prefill_samples_s"]],
+        decode_samples_s=[float(value) for value in payload["decode_samples_s"]],
     )
 
 
@@ -300,10 +300,10 @@ def write_results_csv(results: list[BenchmarkResult], output_path: Path) -> None
         "batch_size",
         "input_len",
         "total_tokens",
-        "prefill_ms_mean",
-        "prefill_ms_std",
-        "decode_ms_mean",
-        "decode_ms_std",
+        "prefill_s_mean",
+        "prefill_s_std",
+        "decode_s_mean",
+        "decode_s_std",
         "prefill_tokens_per_s",
         "decode_tokens_per_s",
         "warmup_runs",
@@ -318,10 +318,10 @@ def write_results_csv(results: list[BenchmarkResult], output_path: Path) -> None
                     "batch_size": result.batch_size,
                     "input_len": result.input_len,
                     "total_tokens": result.total_tokens,
-                    "prefill_ms_mean": result.prefill_ms_mean,
-                    "prefill_ms_std": result.prefill_ms_std,
-                    "decode_ms_mean": result.decode_ms_mean,
-                    "decode_ms_std": result.decode_ms_std,
+                    "prefill_s_mean": result.prefill_s_mean,
+                    "prefill_s_std": result.prefill_s_std,
+                    "decode_s_mean": result.decode_s_mean,
+                    "decode_s_std": result.decode_s_std,
                     "prefill_tokens_per_s": result.prefill_tokens_per_s,
                     "decode_tokens_per_s": result.decode_tokens_per_s,
                     "warmup_runs": result.warmup_runs,
@@ -371,9 +371,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-runs", type=int, default=2, help="Number of warmup runs before timing.")
     parser.add_argument("--measure-runs", type=int, default=5, help="Number of timed runs per case.")
     parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent / "data", help="Directory for generated input data.")
-    parser.add_argument("--case-results-dir", type=Path, default=Path(__file__).resolve().parent / "case_results", help="Directory for per-case result files.")
-    parser.add_argument("--results-json", type=Path, default=Path(__file__).resolve().parent / "results.json", help="Output path for JSON results.")
-    parser.add_argument("--results-csv", type=Path, default=Path(__file__).resolve().parent / "results.csv", help="Output path for CSV results.")
+    parser.add_argument("--case-results-dir", type=Path, default=Path(__file__).resolve().parent / "swiftllm_results", help="Directory for per-case result files.")
+    parser.add_argument("--results-json", type=Path, default=Path(__file__).resolve().parent / "swiftllm_results/results.json", help="Output path for JSON results.")
+    parser.add_argument("--results-csv", type=Path, default=Path(__file__).resolve().parent / "swiftllm_results/results.csv", help="Output path for CSV results.")
     parser.add_argument("--generate-only", action="store_true", help="Generate synthetic input data and exit without running the benchmark.")
     return parser.parse_args()
 

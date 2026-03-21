@@ -1,0 +1,1 @@
+* [与 vllm benchmark 相关文档](https://docs.vllm.ai/en/stable/benchmarking/cli/)
