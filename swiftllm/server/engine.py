@@ -72,6 +72,9 @@ class Engine:
         self.untokenized_raw_requests.append((request, raw_request.prompt))
         while True:
             step_output = await request.output_q.get()
+            # 把当前拿到的这一步输出，立刻返回给调用方，
+            # 但函数本身不结束；当调用方处理结束后,
+            # 下次继续从这里往后执行。
             yield step_output
             request.output_q.task_done()
             if step_output.request.is_finished():

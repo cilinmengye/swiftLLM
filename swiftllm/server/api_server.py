@@ -37,6 +37,11 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
             output_token_ids = []
             prev_decoded = ""
             
+            # generator = engine.add_request_and_stream(raw_request)
+            # 其中函数定义为: async def add_request_and_stream(...) -> AsyncGenerator[StepOutput, None]:
+            # 所以它不是普通 async def，而是一个 异步生成器。异步生成器里的 yield，就相当于“流式地产出一个结果”。
+            # 在add_request_and_stream函数中 yield step_output, 即会调用方的 async for 就会收到一个新的 step_output
+            # 然后继续下一轮循环，add_request_and_stream函数本体再恢复执行，继续等下一个输出
             async for step_output in generator:
                 token_id = step_output.token_id
                 output_token_ids.append(token_id)
