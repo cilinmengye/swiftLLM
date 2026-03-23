@@ -32,6 +32,8 @@ class Engine:
         Run a function on the model asynchronously, and return the result
         """
         func_partial = functools.partial(func, *args, **kwargs)
+        # TODO: 此处性能可以优化，因为其参数为None, 默认开启的是线程池，但是在
+        # Python下线程池是伪多线程，遇到计算强度大的任务需要开启进程池
         return await self.event_loop.run_in_executor(None, func_partial)
 
     async def initialize(self):
