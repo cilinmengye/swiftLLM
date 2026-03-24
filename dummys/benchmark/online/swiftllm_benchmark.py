@@ -191,6 +191,7 @@ class BenchmarkArgs:
     save_detailed: bool
     result_filepath: Path
     request_rates: tuple[float, ...]
+    max_tokens: int
 
 
 def parse_request_rates(raw_value: str) -> tuple[float, ...]:
@@ -333,6 +334,11 @@ def parse_args() -> BenchmarkArgs:
         type=parse_request_rates,
         default=REQUEST_RATES,
     )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=-1,
+    )
     namespace = parser.parse_args()
 
     # 当前脚本只实现了 ShareGPT 的采样逻辑，所以这里直接限制数据集类型。
@@ -364,6 +370,7 @@ def parse_args() -> BenchmarkArgs:
         save_detailed=namespace.save_detailed,
         result_filepath=namespace.result_filepath,
         request_rates=namespace.request_rates,
+        max_tokens=namespace.max_tokens,
     )
 
 
@@ -512,6 +519,7 @@ def load_sharegpt_requests(
     num_requests: int,
     seed: int,
     disable_shuffle: bool,
+    max_tokens: int,
 ) -> list[SampleRequest]:
     """从 ShareGPT 数据集中构造基准测试请求。
 
@@ -521,6 +529,7 @@ def load_sharegpt_requests(
     - `num_requests`：最终需要多少条请求。
     - `seed`：随机种子，用于 shuffle 和 oversample。
     - `disable_shuffle`：若为 `True`，保留原始顺序；否则先打乱再取样。
+    - `max_tokens`: 每个request能够生成的最大output token number。
 
     返回：
     - `list[SampleRequest]`，长度会尽量达到 `num_requests`。
@@ -555,6 +564,10 @@ def load_sharegpt_requests(
         output_len = len(tokenize_text(tokenizer, completion))
         if not is_valid_sequence(prompt_len, output_len):
             continue
+        
+        if max_tokens != -1:    # 即max_tokens不是默认值
+                                # 用户确实传了这个参数
+            output_len = min(max_tokens, output_len)
 
         requests.append(
             SampleRequest(
@@ -1298,6 +1311,7 @@ async def main() -> None:
         num_requests=args.num_prompts,
         seed=args.seed,
         disable_shuffle=args.disable_shuffle,
+        max_tokens=args.max_tokens,
     )
 
     csv_rows: list[dict[str, float]] = []
