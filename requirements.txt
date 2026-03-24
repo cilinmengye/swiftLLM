@@ -1,7 +1,7 @@
-aiohttp>=3.9
+aiohttp>=3.9            # my added
 fastapi>=0.111
 flash_attn>=2.5.8
-numpy>=1.26
+numpy>=1.26             # my added
 ray[default]>=2.21
 safetensors>=0.4.3
 transformers>=4.40

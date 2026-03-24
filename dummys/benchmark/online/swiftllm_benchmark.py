@@ -111,6 +111,7 @@ class RequestMetrics:
     字段说明：
     - `request_id`：对应哪个请求样本。
     - `prompt_len`：输入 token 数，后面聚合指标时会用到。
+    - `expected_output_len`：请求期望生成的输出 token 上限。
     - `success`：这个请求是否成功拿到了至少一个有效 token。
     - `latency`：端到端总时延，即最后一个 token 到达减去请求发起时间。
     - `output_tokens`：实际收到的输出 token 数。
@@ -118,12 +119,18 @@ class RequestMetrics:
     - `itls`：每两个相邻 token 之间的时间差列表。
     - `error`：如果失败，这里记录错误信息。
     - `start_time`：请求开始发送时的绝对时间戳（perf_counter 基准）。
+    - `response_headers_time`：收到响应头时的绝对时间戳。
+    - `first_token_time`：首个合法 token 行到达时的绝对时间戳。
+    - `last_token_time`：最后一个合法 token 行到达时的绝对时间戳。
+    - `invalid_line_count`：流里出现的非法非空行数量。
+    - `hit_max_output_len`：实际输出 token 数是否打满期望上限。
 
     这个结构体是后续所有统计汇总的原始数据来源。
     """
 
     request_id: str
     prompt_len: int
+    expected_output_len: int = 0
     success: bool = False
     latency: float = 0.0
     output_tokens: int = 0
@@ -131,6 +138,11 @@ class RequestMetrics:
     itls: list[float] = field(default_factory=list)
     error: str = ""
     start_time: float = 0.0
+    response_headers_time: float = 0.0
+    first_token_time: float = 0.0
+    last_token_time: float = 0.0
+    invalid_line_count: int = 0
+    hit_max_output_len: bool = False
 
 
 @dataclass(frozen=True)
@@ -611,6 +623,60 @@ def build_delay_schedule(
     return delay_schedule
 
 
+def parse_stream_lines(chunk_buffer: bytearray) -> list[str]:
+    """从累计的字节缓冲区里提取完整的 UTF-8 文本行。
+
+    参数：
+    - `chunk_buffer`：不断追加响应原始字节后的可变缓冲区。
+
+    返回：
+    - 当前已经完整接收到的文本行列表；
+    - 缓冲区中最后一个不完整的尾巴会被保留，等待下一个 chunk 补齐。
+
+    这样做是为了把 aiohttp 的底层 transport chunk 重组为真正按换行切分的 token 行，
+    避免把 chunk 边界误当成 token 边界。
+    """
+
+    complete_lines: list[str] = []
+    while True:
+        newline_index = chunk_buffer.find(b"\n")
+        if newline_index < 0:
+            break
+        raw_line = bytes(chunk_buffer[:newline_index])
+        del chunk_buffer[: newline_index + 1]
+        complete_lines.append(raw_line.decode("utf-8").strip())
+    return complete_lines
+
+
+def consume_stream_line(
+    result: RequestMetrics,
+    line: str,
+    started_at: float,
+    most_recent_timestamp: float,
+) -> float:
+    """消费一条已经按换行切好的 token 行，并更新单请求指标。"""
+
+    if not line:
+        return most_recent_timestamp
+
+    try:
+        int(line)
+    except ValueError as error:
+        result.invalid_line_count += 1
+        raise ValueError(f"Invalid token line: {line!r}") from error
+
+    timestamp = time.perf_counter()
+    if result.output_tokens == 0:
+        result.ttft = timestamp - started_at
+        result.first_token_time = timestamp
+    else:
+        result.itls.append(timestamp - most_recent_timestamp)
+
+    result.last_token_time = timestamp
+    result.output_tokens += 1
+    return timestamp
+
+
 async def issue_request(
     session: aiohttp.ClientSession,
     api_url: str,
@@ -639,7 +705,11 @@ async def issue_request(
     - 如果服务端在流式输出时还做逐 token 文本解码，会引入额外 Python 开销，污染 TTFT / ITL。
     """
 
-    result = RequestMetrics(request_id=request.request_id, prompt_len=request.prompt_len)
+    result = RequestMetrics(
+        request_id=request.request_id,
+        prompt_len=request.prompt_len,
+        expected_output_len=request.output_len,
+    )
     payload = {
         "prompt": request.prompt,
         "output_len": request.output_len,
@@ -650,33 +720,38 @@ async def issue_request(
     started_at = time.perf_counter()
     result.start_time = started_at
     most_recent_timestamp = started_at
+    chunk_buffer = bytearray()
 
     try:
         async with session.post(api_url, json=payload) as response:
+            result.response_headers_time = time.perf_counter()
             if response.status != 200:
                 response_text = await response.text()
                 result.error = f"HTTP {response.status}: {response_text}"
                 return result
 
-            async for raw_line in response.content:
-                line = raw_line.decode("utf-8").strip()
-                if not line:
+            async for chunk in response.content.iter_any():
+                if not chunk:
                     continue
+                chunk_buffer.extend(chunk)
+                for line in parse_stream_lines(chunk_buffer):
+                    most_recent_timestamp = consume_stream_line(
+                        result=result,
+                        line=line,
+                        started_at=started_at,
+                        most_recent_timestamp=most_recent_timestamp,
+                    )
 
-                # 这里显式转成 int，是在验证当前行确实是一个 token id。
-                # 如果服务端返回了非整数内容，这里会抛异常并进入 except，避免把脏数据记成成功。
-                int(line)
-                timestamp = time.perf_counter()
-
-                # 第一个 token 到达时，测得的是 TTFT；
-                # 后续 token 到达时，测得的是和上一个 token 的间隔 ITL。
-                if result.output_tokens == 0:
-                    result.ttft = timestamp - started_at
-                else:
-                    result.itls.append(timestamp - most_recent_timestamp)
-
-                most_recent_timestamp = timestamp
-                result.output_tokens += 1
+            if chunk_buffer:
+                trailing_line = chunk_buffer.decode("utf-8").strip()
+                chunk_buffer.clear()
+                if trailing_line:
+                    most_recent_timestamp = consume_stream_line(
+                        result=result,
+                        line=trailing_line,
+                        started_at=started_at,
+                        most_recent_timestamp=most_recent_timestamp,
+                    )
 
             # 如果 HTTP 成功但一个合法 token 都没收到，也视为失败。
             if result.output_tokens == 0:
@@ -685,6 +760,7 @@ async def issue_request(
 
             result.success = True
             result.latency = most_recent_timestamp - started_at
+            result.hit_max_output_len = result.output_tokens >= result.expected_output_len
             return result
     except Exception as error:
         result.error = str(error)
@@ -926,9 +1002,23 @@ def build_result_payload(
 
     total_input_tokens = sum(request.prompt_len for request, output in zip(requests, outputs) if output.success)
     output_lens = [output.output_tokens if output.success else 0 for output in outputs]
+    expected_output_lens = [output.expected_output_len for output in outputs]
     total_output_tokens = sum(output_lens)
     completed = sum(1 for output in outputs if output.success)
     failed = len(outputs) - completed
+    response_header_latencies = [
+        (output.response_headers_time - output.start_time)
+        for output in outputs
+        if output.success and output.response_headers_time > 0.0
+    ]
+    first_token_after_headers = [
+        (output.first_token_time - output.response_headers_time)
+        for output in outputs
+        if output.success and output.first_token_time > 0.0 and output.response_headers_time > 0.0
+    ]
+    actual_output_tokens = [output.output_tokens for output in outputs if output.success]
+    max_output_len_hits = sum(1 for output in outputs if output.success and output.hit_max_output_len)
+    total_invalid_lines = sum(output.invalid_line_count for output in outputs)
 
     # 这个指标不是现有 CSV 的一部分，但有助于补足 README 里“per input token latency”的讨论。
     per_input_token_latencies = [
@@ -959,6 +1049,12 @@ def build_result_payload(
         "failed": failed,
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
+        "mean_expected_output_tokens": safe_mean(expected_output_lens),
+        "mean_actual_output_tokens": safe_mean(actual_output_tokens),
+        "median_actual_output_tokens": safe_median(actual_output_tokens),
+        "hit_max_output_len_count": max_output_len_hits,
+        "hit_max_output_len_ratio": (max_output_len_hits / completed) if completed > 0 else 0.0,
+        "total_invalid_stream_lines": total_invalid_lines,
         "request_throughput": completed / benchmark_duration if benchmark_duration > 0.0 else 0.0,
         "request_goodput": None,
         "output_throughput": total_output_tokens / benchmark_duration if benchmark_duration > 0.0 else 0.0,
@@ -967,7 +1063,10 @@ def build_result_payload(
         "max_concurrent_requests": max_concurrent_requests,
         "rtfx": 0.0,
         "mean_per_input_token_latency_ms": safe_mean(successful_per_input_token_latencies) * 1000.0,
+        "mean_response_headers_latency_ms": safe_mean(response_header_latencies) * 1000.0,
+        "mean_headers_to_first_token_latency_ms": safe_mean(first_token_after_headers) * 1000.0,
     }
+
 
     add_metric_summary(result, "ttft", ttfts, args.percentile_metrics, args.metric_percentiles)
     add_metric_summary(result, "tpot", tpots, args.percentile_metrics, args.metric_percentiles)
@@ -977,10 +1076,26 @@ def build_result_payload(
     # save_detailed=True 时，把逐请求原始数据也保存在 JSON 里，便于后续排查异常样本。
     if args.save_detailed:
         result["input_lens"] = [output.prompt_len for output in outputs]
+        result["expected_output_lens"] = expected_output_lens
         result["output_lens"] = output_lens
         result["ttfts"] = [output.ttft for output in outputs]
         result["itls"] = [output.itls for output in outputs]
         result["start_times"] = [output.start_time for output in outputs]
+        result["response_headers_times"] = [output.response_headers_time for output in outputs]
+        result["first_token_times"] = [output.first_token_time for output in outputs]
+        result["last_token_times"] = [output.last_token_time for output in outputs]
+        result["response_headers_latencies"] = [
+            (output.response_headers_time - output.start_time) if output.response_headers_time > 0.0 else 0.0
+            for output in outputs
+        ]
+        result["headers_to_first_token_latencies"] = [
+            (output.first_token_time - output.response_headers_time)
+            if output.first_token_time > 0.0 and output.response_headers_time > 0.0
+            else 0.0
+            for output in outputs
+        ]
+        result["invalid_line_counts"] = [output.invalid_line_count for output in outputs]
+        result["hit_max_output_len"] = [output.hit_max_output_len for output in outputs]
         result["errors"] = [output.error for output in outputs]
         result["request_ids"] = [output.request_id for output in outputs]
         result["per_input_token_latencies"] = per_input_token_latencies
