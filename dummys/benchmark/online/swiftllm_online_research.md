@@ -254,8 +254,21 @@ python dummys/benchmark/online/swiftllm_benchmark.py \
   --max-concurrency 256 \
   --seed 0 \
   --disable-shuffle \
-  --save-result \
-  --save-detailed
+  --save-result 
+```
+
+## How to use swiftllm api server
+
+start: `python api_server.py --model-path /mnt/hdd/data/yxlin/huggingface/Meta-Llama-3.1-8B --host 0.0.0.0 --port 8000`
+
+test: 
+```
+curl -N -X POST http://127.0.0.1:8000/generate   -H "Content-Type: application/json"   -d '{
+    "prompt": "Summarize the main ideas of Jeff Walker'\''s Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...",
+    "max_tokens": 1000,
+    "stream": true,
+    "decode": true
+  }'
 ```
 
 ## How to compare with vLLM

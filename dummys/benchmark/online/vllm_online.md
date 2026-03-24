@@ -79,6 +79,19 @@ vllm serve /mnt/hdd/data/yxlin/huggingface/Meta-Llama-3.1-8B \
 
 vLLM 的 `vllm serve` 会启动 OpenAI-compatible server，可用于 `/v1/chat/completions` 或 `/v1/completions`。([vLLM][3])
 
+
+简单的测试命令:
+```bash
+curl -N http://127.0.0.1:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/mnt/hdd/data/yxlin/huggingface/Meta-Llama-3.1-8B",
+    "prompt": "Summarize the main ideas of Jeff Walker'\''s Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...",
+    "max_tokens": 1000,
+    "stream": true
+  }'
+```
+
 ### 建议
 
 * 如果模型是 **Instruct/Chat 模型**，benchmark 用：

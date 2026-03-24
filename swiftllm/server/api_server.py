@@ -24,9 +24,14 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
     - `decode`: boolean, whether to decode the output tokens (default: True)
     """
     req_dict = await req.json()
+    max_tokens = req_dict.get("max_tokens", req_dict.get("output_len"))
+    if max_tokens is None:
+        raise fastapi.HTTPException(status_code=400, detail="Missing required field: max_tokens")
+
     raw_request = swiftllm.RawRequest(
-        prompt = req_dict["prompt"],
-        output_len = req_dict["output_len"]
+        prompt=req_dict["prompt"],
+        max_tokens=max_tokens,
+        ignore_eos=req_dict.get("ignore_eos", False),   # 是否忽略结束token
     )
     # Whether to decode the output
     decode_output = req_dict.get("decode", False)
@@ -36,7 +41,7 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
         async def wrapper():
             output_token_ids = []
             prev_decoded = ""
-            
+
             # generator = engine.add_request_and_stream(raw_request)
             # 其中函数定义为: async def add_request_and_stream(...) -> AsyncGenerator[StepOutput, None]:
             # 所以它不是普通 async def，而是一个 异步生成器。异步生成器里的 yield，就相当于“流式地产出一个结果”。
@@ -45,7 +50,7 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
             async for step_output in generator:
                 token_id = step_output.token_id
                 output_token_ids.append(token_id)
-                
+
                 if decode_output:
                     # Only decode new tokens
                     try:
@@ -60,7 +65,7 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
                             # Extract new content from combined result
                             if last_two and len(last_two) > len(prev_decoded):
                                 new_token = last_two[len(prev_decoded):]
-                        
+
                         prev_decoded += new_token
                         yield f"{prev_decoded}\n"
                     except Exception:
@@ -71,21 +76,24 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
                 else:
                     # Output token ID without decoding
                     yield f"{token_id}\n"
-        
+
         return fastapi.responses.StreamingResponse(
             wrapper(),
             media_type="text/plain"
         )
     else:
         # TODO Abort the request when the client disconnects
-        (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
-        
-        response_content = {"output_token_ids": output_token_ids}
-        
+        (request, output_token_ids) = await engine.add_request_and_wait(raw_request)
+
+        response_content = {
+            "output_token_ids": output_token_ids,
+            "finish_reason": request.finish_reason,
+        }
+
         if decode_output:
             decoded = await engine.tokenization_engine.decode.remote(output_token_ids, skip_special_tokens=True)
             response_content["output"] = decoded
-        
+
         return fastapi.responses.JSONResponse(content=response_content)
 
 if __name__ == "__main__":
@@ -122,5 +130,5 @@ if __name__ == "__main__":
             traceback.print_exc()
             uvicorn_task.cancel()
             os._exit(1) # Kill myself, or it will print tons of errors. Don't know why.
-    
+
     asyncio.run(main_coroutine())

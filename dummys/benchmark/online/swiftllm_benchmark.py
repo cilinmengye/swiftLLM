@@ -92,7 +92,7 @@ class SampleRequest:
     - `request_id`：请求唯一标识，便于在结果里追踪。
     - `prompt`：真正发送到服务端的输入文本。
     - `prompt_len`：输入 token 数，用于统计吞吐和派生 per-input-token latency。
-    - `output_len`：期望生成的输出 token 数，会作为 `/generate` 的 `output_len` 参数传给服务端。
+    - `output_len`：期望生成的输出 token 上限，会作为 `/generate` 的 `max_tokens` 参数传给服务端。
 
     之所以把它单独定义成 dataclass，是为了把“输入样本”和“运行结果”分开，
     避免后面在 benchmark 执行时混淆。
@@ -124,6 +124,7 @@ class RequestMetrics:
     - `last_token_time`：最后一个合法 token 行到达时的绝对时间戳。
     - `invalid_line_count`：流里出现的非法非空行数量。
     - `hit_max_output_len`：实际输出 token 数是否打满期望上限。
+    - `finish_reason`：服务端返回的停止原因，例如 `eos` / `max_tokens`。
 
     这个结构体是后续所有统计汇总的原始数据来源。
     """
@@ -143,6 +144,7 @@ class RequestMetrics:
     last_token_time: float = 0.0
     invalid_line_count: int = 0
     hit_max_output_len: bool = False
+    finish_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -162,6 +164,7 @@ class BenchmarkArgs:
     - `max_concurrency`：客户端允许的最大并发请求数。
     - `seed`：随机种子，用于可复现的 shuffle / oversample / arrival schedule。
     - `disable_shuffle`：是否保留数据集原始顺序。
+    - `ignore_eos`：是否忽略 EOS 并继续生成到上限。
     - `percentile_metrics`：哪些指标需要额外计算分位数。
     - `metric_percentiles`：需要计算的百分位列表，例如 50/95/99。
     - `save_result`：是否保存每个请求速率的详细 JSON。
@@ -181,6 +184,7 @@ class BenchmarkArgs:
     max_concurrency: int
     seed: int
     disable_shuffle: bool
+    ignore_eos: bool
     percentile_metrics: tuple[str, ...]
     metric_percentiles: tuple[float, ...]
     save_result: bool
@@ -295,6 +299,11 @@ def parse_args() -> BenchmarkArgs:
         default=True,
     )
     parser.add_argument(
+        "--ignore-eos",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
         "--percentile-metrics",
         type=parse_percentile_metrics,
         default=parse_percentile_metrics("ttft,tpot,itl,e2el"),
@@ -312,7 +321,7 @@ def parse_args() -> BenchmarkArgs:
     parser.add_argument(
         "--save-detailed",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     parser.add_argument(
         "--result-filepath",
@@ -348,6 +357,7 @@ def parse_args() -> BenchmarkArgs:
         max_concurrency=namespace.max_concurrency,
         seed=namespace.seed,
         disable_shuffle=namespace.disable_shuffle,
+        ignore_eos=namespace.ignore_eos,
         percentile_metrics=namespace.percentile_metrics,
         metric_percentiles=namespace.metric_percentiles,
         save_result=namespace.save_result,
@@ -681,6 +691,7 @@ async def issue_request(
     session: aiohttp.ClientSession,
     api_url: str,
     request: SampleRequest,
+    args: BenchmarkArgs,
 ) -> RequestMetrics:
     """向 SwiftLLM 发送一个流式请求，并记录延迟指标。
 
@@ -712,7 +723,8 @@ async def issue_request(
     )
     payload = {
         "prompt": request.prompt,
-        "output_len": request.output_len,
+        "max_tokens": request.output_len,
+        "ignore_eos": args.ignore_eos,
         "stream": True,
         "decode": False,
     }
@@ -725,6 +737,9 @@ async def issue_request(
     try:
         async with session.post(api_url, json=payload) as response:
             result.response_headers_time = time.perf_counter()
+            finish_reason_header = response.headers.get("X-SwiftLLM-Finish-Reason", "")
+            if finish_reason_header:
+                result.finish_reason = finish_reason_header
             if response.status != 200:
                 response_text = await response.text()
                 result.error = f"HTTP {response.status}: {response_text}"
@@ -761,6 +776,8 @@ async def issue_request(
             result.success = True
             result.latency = most_recent_timestamp - started_at
             result.hit_max_output_len = result.output_tokens >= result.expected_output_len
+            if not result.finish_reason:
+                result.finish_reason = "max_tokens" if result.hit_max_output_len else "eos"
             return result
     except Exception as error:
         result.error = str(error)
@@ -771,6 +788,7 @@ async def run_readiness_check(
     session: aiohttp.ClientSession,
     api_url: str,
     request: SampleRequest,
+    args: BenchmarkArgs,
 ) -> None:
     """在正式压测前，先用一个样本请求检查服务是否可用。
 
@@ -788,7 +806,7 @@ async def run_readiness_check(
     - 尽量把“服务不可用”和“高压下性能退化”分开。
     """
 
-    result = await issue_request(session, api_url, request)
+    result = await issue_request(session, api_url, request, args)
     if not result.success:
         raise RuntimeError(f"SwiftLLM readiness check failed: {result.error}")
 
@@ -1017,8 +1035,14 @@ def build_result_payload(
         if output.success and output.first_token_time > 0.0 and output.response_headers_time > 0.0
     ]
     actual_output_tokens = [output.output_tokens for output in outputs if output.success]
-    max_output_len_hits = sum(1 for output in outputs if output.success and output.hit_max_output_len)
     total_invalid_lines = sum(output.invalid_line_count for output in outputs)
+    max_output_len_hits = sum(1 for output in outputs if output.success and output.hit_max_output_len)
+    finish_reasons = [output.finish_reason for output in outputs if output.success and output.finish_reason]
+    finish_reason_counts: dict[str, int] = {}
+    for finish_reason in finish_reasons:
+        finish_reason_counts[finish_reason] = finish_reason_counts.get(finish_reason, 0) + 1
+    eos_stop_count = finish_reason_counts.get("eos", 0)
+    max_tokens_stop_count = finish_reason_counts.get("max_tokens", 0)
 
     # 这个指标不是现有 CSV 的一部分，但有助于补足 README 里“per input token latency”的讨论。
     per_input_token_latencies = [
@@ -1055,6 +1079,11 @@ def build_result_payload(
         "hit_max_output_len_count": max_output_len_hits,
         "hit_max_output_len_ratio": (max_output_len_hits / completed) if completed > 0 else 0.0,
         "total_invalid_stream_lines": total_invalid_lines,
+        "finish_reason_counts": finish_reason_counts,
+        "eos_stop_count": eos_stop_count,
+        "eos_stop_ratio": (eos_stop_count / completed) if completed > 0 else 0.0,
+        "max_tokens_stop_count": max_tokens_stop_count,
+        "max_tokens_stop_ratio": (max_tokens_stop_count / completed) if completed > 0 else 0.0,
         "request_throughput": completed / benchmark_duration if benchmark_duration > 0.0 else 0.0,
         "request_goodput": None,
         "output_throughput": total_output_tokens / benchmark_duration if benchmark_duration > 0.0 else 0.0,
@@ -1096,6 +1125,7 @@ def build_result_payload(
         ]
         result["invalid_line_counts"] = [output.invalid_line_count for output in outputs]
         result["hit_max_output_len"] = [output.hit_max_output_len for output in outputs]
+        result["finish_reasons"] = [output.finish_reason for output in outputs]
         result["errors"] = [output.error for output in outputs]
         result["request_ids"] = [output.request_id for output in outputs]
         result["per_input_token_latencies"] = per_input_token_latencies
@@ -1212,13 +1242,13 @@ async def benchmark_request_rate(
     semaphore = asyncio.Semaphore(args.max_concurrency)
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=False) as session:
-        await run_readiness_check(session, api_url, requests[0])
+        await run_readiness_check(session, api_url, requests[0], args)
 
         async def limited_issue(request: SampleRequest) -> RequestMetrics:
             """在并发信号量保护下发出单个请求。"""
 
             async with semaphore:
-                return await issue_request(session, api_url, request)
+                return await issue_request(session, api_url, request, args)
 
         benchmark_start_time = time.perf_counter()
         tasks: list[asyncio.Task[RequestMetrics]] = []

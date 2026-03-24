@@ -188,3 +188,143 @@
 2. **已确认原 benchmark 的流式解析方式存在较大风险，并已修复。**
 3. **接下来需要重新跑数据，判断剩余差距里有多少来自实际输出长度/停止语义不一致。**
 4. **只有在 benchmark 客户端确认可靠后，才能继续把剩余差距归因到 SwiftLLM 服务端实现。**
+
+---
+
+## 追加结论：output tokens 差异的根因与本轮修正
+
+### 1. `total_input_tokens` 一致但 `total_output_tokens` 差异巨大的根因
+
+在 `num_prompts=500` 时，SwiftLLM 与 vLLM 的 `total_input_tokens` 都是 `109944`，这说明两边拿到的 ShareGPT 输入样本基本一致，问题不在输入集。
+
+真正的差异在于**输出长度语义不一致**：
+
+- vLLM benchmark 把 ShareGPT completion token 长度当成 `max_tokens` 上限；
+- vLLM 服务端允许请求在遇到 EOS 时提前停止，因此统计的是**实际生成 token 数**；
+- SwiftLLM 原先把同一个长度字段当成“必须生成这么多 token”，也就是固定长度生成；
+- 因此 SwiftLLM 的 `total_output_tokens` 会接近所有样本 `output_len` 之和，而不是实际生成长度之和。
+
+这正是为什么：
+
+- SwiftLLM 的 `mean_expected_output_tokens == mean_actual_output_tokens`；
+- `hit_max_output_len_ratio == 1.0`；
+- `total_output_tokens` 长期固定在 `101045` 左右；
+- 而 vLLM 的 `total_output_tokens` 只在约 `5.8w ~ 6.2w` 间波动。
+
+所以，**当前两边 benchmark 比较的不是相同工作量**。在这种前提下比较 TTFT / TPOT / throughput，没有解释价值。
+
+### 2. 线程池不是这次 output token 失真的主因
+
+`swiftllm/server/engine.py` 中 `_run_on_model_async()` 目前使用：
+
+- `event_loop.run_in_executor(None, ...)`
+
+这确实可能影响：
+
+- TTFT
+- ITL
+- 吞吐
+- 高并发下的调度抖动
+
+但它**不能解释**下面这些现象：
+
+- 所有请求几乎都打满输出上限；
+- `total_output_tokens` 基本固定；
+- `mean_actual_output_tokens` 与 `mean_expected_output_tokens` 基本相等。
+
+这些现象只能由“停止条件本身写成固定长度停止”解释，而不是线程池类型解释。
+
+因此本轮结论是：
+
+- **线程池问题是第二阶段性能优化议题；**
+- **不是本轮 SwiftLLM output token 明显偏大的主因。**
+
+### 3. 本轮已完成的代码修正
+
+本轮已经把 SwiftLLM 的生成语义从“固定长度生成”改成“`max_tokens` 上限 + EOS 提前停止”语义，核心改动如下。
+
+#### 服务端
+
+- `swiftllm/server/structs.py`
+  - `RawRequest` 从 `output_len` 改为 `max_tokens`
+  - 新增 `ignore_eos`
+  - `Request` 新增 `finish_reason`
+  - 新增 `maybe_mark_finished()`，按以下顺序停止：
+    - 达到 `max_tokens`
+    - 命中 EOS 且 `ignore_eos=False`
+
+- `swiftllm/server/tokenization_engine.py`
+  - 新增 `get_eos_token_id()`，供 engine 初始化时读取 tokenizer 的 EOS id
+
+- `swiftllm/server/engine.py`
+  - 初始化时缓存 `eos_token_id`
+  - 在每步生成后调用 `req.maybe_mark_finished(output_token, self.eos_token_id)`
+  - 保持现有 scheduler / resource free 路径不变，只修正停止语义
+
+- `swiftllm/server/api_server.py`
+  - `/generate` 同时兼容读取：
+    - `max_tokens`
+    - 旧字段 `output_len`（向后兼容）
+  - 非流式返回中新增 `finish_reason`
+
+#### benchmark 客户端
+
+- `dummys/benchmark/online/swiftllm_benchmark.py`
+  - 请求 payload 从 `output_len` 改成 `max_tokens`
+  - 新增 CLI 参数：`--ignore-eos`
+  - 单请求指标新增 `finish_reason`
+  - 聚合结果新增：
+    - `finish_reason_counts`
+    - `eos_stop_count` / `eos_stop_ratio`
+    - `max_tokens_stop_count` / `max_tokens_stop_ratio`
+  - 修复了 `issue_request()` / `run_readiness_check()` / `benchmark_request_rate()` 之间的参数传递不一致问题
+  - 恢复了 `total_invalid_stream_lines` 所需的聚合变量定义
+
+### 4. 当前 stop reason 统计口径
+
+本轮 streaming 接口没有额外引入复杂的结束事件协议；当前 benchmark 采用的是最小可用口径：
+
+- 若请求输出 token 数打满 `expected_output_len`，记为 `max_tokens`；
+- 若未打满且请求成功完成，当前口径记为 `eos`。
+
+在目前 SwiftLLM 仅支持 `max_tokens` / `eos` 两种停止条件的前提下，这个口径已经足够用于本轮 benchmark 对齐。
+
+如果未来再引入：
+
+- `stop_token_ids`
+- stop string
+- 其他 finish reason
+
+则 streaming 协议需要再扩展，以避免把所有“未打满上限”的完成都归为 `eos`。
+
+### 5. 已完成的验证
+
+本轮已完成的验证是：
+
+1. `python -m py_compile` 检查以下文件，均已通过：
+   - `swiftllm/server/api_server.py`
+   - `swiftllm/server/structs.py`
+   - `swiftllm/server/engine.py`
+   - `swiftllm/server/tokenization_engine.py`
+   - `dummys/benchmark/online/swiftllm_benchmark.py`
+   - `examples/online.py`
+2. `python dummys/benchmark/online/swiftllm_benchmark.py --help` 已通过，CLI 参数正常，包含新的 `--ignore-eos`
+3. 编辑器诊断结果显示本轮改动文件没有语法错误；仅 `engine.py` 中已有一个未使用 `torch` 的提示，不影响运行
+
+### 6. 下一步验证重点
+
+下一步不该继续猜测线程池，而应先重新跑 benchmark，验证这次语义修正是否真正把工作量口径对齐。建议顺序如下：
+
+1. 小规模验证（少量 prompts、少量 request rates）
+   - 看 `mean_actual_output_tokens` 是否明显下降；
+   - 看 `hit_max_output_len_ratio` 是否明显低于 `1.0`；
+   - 看 `finish_reason_counts` 是否出现大量 `eos`。
+
+2. 再跑 `num_prompts=500` 对照 vLLM
+   - 比较 `total_input_tokens` 是否继续一致；
+   - 比较 `total_output_tokens` 是否不再锁死在 `101045`；
+   - 比较 SwiftLLM 与 vLLM 的 `total_output_tokens` 是否进入同一量级。
+
+3. 只有在 output token 工作量口径基本对齐后，再讨论：
+   - `_run_on_model_async()` 的线程池是否该优化；
+   - scheduler / polling / flush 是否仍然拖慢高压 TTFT。
