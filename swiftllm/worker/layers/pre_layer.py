@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.worker.weight import LlamaWeight
@@ -11,6 +12,8 @@ class LlamaPreLayer:
     ):
         self.model_config = model_config
         self.weights = weights
+        self.tp_size = dist.get_world_size()
+        self.tp_rank = dist.get_rank()
     
     def forward(
         self,

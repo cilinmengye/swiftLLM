@@ -2,6 +2,7 @@ import itertools
 import math
 
 import torch
+import torch.distributed as dist
 
 from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
@@ -38,6 +39,9 @@ class LlamaModel:
         Initialize the LlamaModel.
         """
         self.engine_config = engine_config  # EngineConfig data class
+
+        # tensor parallel config
+        self.tp_size = dist.get_world_size()
 
         # Load model config
         self.model_config = LlamaModelConfig.load_from_model_path(engine_config.model_path)

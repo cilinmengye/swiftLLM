@@ -24,6 +24,9 @@ class EngineConfig:
     max_batch_size: int
     max_tokens_in_batch: int
 
+    # Model tensor parallel
+    tensor_parallel_size: int
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         """
@@ -85,3 +88,9 @@ class EngineConfig:
             help="Maximum number of tokens in a batch",
         )
         
+        parser.add_argument(
+            "--tensor-parallel-size",
+            type=int,
+            default=1,
+            help="Model tensor parallel size",
+        )

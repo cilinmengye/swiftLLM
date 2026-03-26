@@ -16,7 +16,7 @@ from .scheduler import Scheduler
 class Engine:
     def __init__(self, engine_config: EngineConfig):
         self.engine_config = engine_config
-        self.model_config = LlamaModelConfig.load_from_model_path(engine_config.model_path)
+        # self.model_config = LlamaModelConfig.load_from_model_path(engine_config.model_path)
         self.initialized = False
 
         # The following fields will be created on `init_model()`
@@ -45,21 +45,21 @@ class Engine:
     async def initialize(self):
         self.event_loop = asyncio.get_event_loop()
 
-        print("[Engine] Initializing model...")
-        self.model = LlamaModel(self.engine_config)
+        # print("[Engine] Initializing model...")
+        # self.model = LlamaModel(self.engine_config)
 
-        print("[Engine] Loading weights...")
-        self.model.load_weights()
+        # print("[Engine] Loading weights...")
+        # self.model.load_weights()
 
-        print("[Engine] Profiling kv blocks...")
-        num_gpu_blocks = self.model.profile_num_blocks()
-        num_cpu_blocks = self.engine_config.num_cpu_blocks
-        block_size_bytes = self.engine_config.block_size*self.model_config.get_kvslot_size()
-        print(f"[Engine] Number of GPU blocks: {num_gpu_blocks} ({num_gpu_blocks*block_size_bytes/GB:.2f} GB)")
-        print(f"[Engine] Number of CPU blocks: {num_cpu_blocks} ({num_cpu_blocks*block_size_bytes/GB:.2f} GB)")
+        # print("[Engine] Profiling kv blocks...")
+        # num_gpu_blocks = self.model.profile_num_blocks()
+        # num_cpu_blocks = self.engine_config.num_cpu_blocks
+        # block_size_bytes = self.engine_config.block_size*self.model_config.get_kvslot_size()
+        # print(f"[Engine] Number of GPU blocks: {num_gpu_blocks} ({num_gpu_blocks*block_size_bytes/GB:.2f} GB)")
+        # print(f"[Engine] Number of CPU blocks: {num_cpu_blocks} ({num_cpu_blocks*block_size_bytes/GB:.2f} GB)")
 
-        print("[Engine] Allocating kv cache and swap...")
-        self.model.init_kvcache_and_swap(num_gpu_blocks)
+        # print("[Engine] Allocating kv cache and swap...")
+        # self.model.init_kvcache_and_swap(num_gpu_blocks)
 
         print("[Engine] Initializing scheduler...")
         self.scheduler = Scheduler(self.model, self.engine_config, num_gpu_blocks)
