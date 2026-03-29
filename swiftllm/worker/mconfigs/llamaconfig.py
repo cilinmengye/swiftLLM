@@ -4,6 +4,30 @@ import torch
 
 _LLAMAMODELCONFIG = None
 
+
+def _parse_torch_dtype(torch_dtype: str | torch.dtype | None) -> torch.dtype:
+    """
+    Convert the HuggingFace config field `torch_dtype` into an actual `torch.dtype`.
+
+    config.json usually stores this field as a string such as "float16" or "bfloat16".
+    We parse it once in the model config so that the worker can set the correct default
+    dtype *before* constructing CUDA parameters.
+    """
+    if torch_dtype is None:
+        return torch.float16
+
+    if isinstance(torch_dtype, torch.dtype):
+        return torch_dtype
+
+    if isinstance(torch_dtype, str):
+        attr_name = torch_dtype.removeprefix("torch.")
+        parsed_dtype = getattr(torch, attr_name, None)
+        if isinstance(parsed_dtype, torch.dtype):
+            return parsed_dtype
+
+    raise ValueError(f"Unsupported torch dtype in model config: {torch_dtype}")
+
+
 class LlamaModelConfig:
     """
     The configuration of a LLaMA model (including LLaMA 1/2/3).
@@ -29,6 +53,7 @@ class LlamaModelConfig:
         self.ffn_inter_dim = model_config["intermediate_size"]
         self.rotary_base = model_config.get("rope_theta", model_config.get("rotary_base", 10000))
         self.rms_norm_eps = model_config["rms_norm_eps"]
+        self.torch_dtype = _parse_torch_dtype(model_config.get("torch_dtype"))
         self.rope_scaling = model_config.get("rope_scaling", 1.0)
         self.rope_theta = model_config.get("rope_theta", 10000)
         if self.rope_scaling is None:

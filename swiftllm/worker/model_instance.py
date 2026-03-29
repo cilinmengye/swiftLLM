@@ -296,17 +296,24 @@ class ModelInstance:
 
         # 调用 model forward
         input_ids = torch.tensor(flattened_input_ids, dtype=torch.int32, device="cuda")
-        logits = self.model(input_ids)
+        hidden_states = self.model(input_ids)
+        logits = self.model.compute_logits(hidden_states)
 
         # 执行采样算法
         output_tokens = self.sampler(logits)
-        
+
         return output_tokens
 
-    def sampler(self, logits: torch.Tensor) -> list[int]:
+    def sampler(self, logits: torch.Tensor | None) -> list[int] | None:
         """
-        目前直接进行贪婪采样
+        目前直接进行贪婪采样。
+
+        TP>1 时只有 rank0 会拿到完整 vocab logits，因此也只有 rank0 能做正确采样；
+        其他 rank 此时返回 None，仅承担前向与通信计算角色。
         """
+        if logits is None:
+            return None
+
         output_tokens = torch.argmax(logits, dim=1)
         return output_tokens.tolist()
 

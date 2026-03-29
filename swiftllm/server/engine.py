@@ -47,11 +47,11 @@ class Engine:
         print("[Engine] Initializing model...")
         self.model = LLMEngine(self.engine_config)
 
-        model_config = LlamaModelConfig.get_model_config
+        model_config = LlamaModelConfig.get_model_config()
 
         print("[Engine] Initializing scheduler...")
         assert model_config.num_gpu_blocks > 0
-        self.scheduler = Scheduler(self.model, self.engine_config, model_config.num_gpu_blocks)
+        self.scheduler = Scheduler(model_config, self.engine_config, model_config.num_gpu_blocks)
 
         print("[Engine] Initializing tokenization engine...")
         self.tokenization_engine = TokenizationEngine.remote(self.engine_config)

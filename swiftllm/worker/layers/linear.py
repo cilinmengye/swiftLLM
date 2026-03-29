@@ -58,7 +58,9 @@ class ColParallelLinear(LinearBase):
 
     def load_weight(self, weight: torch.Tensor, weight_name: str = None):
         shard_size = self.weight.data.size(0)   # 注意在我们真正实现Linear维度时,是output_size为第一维
-        start_idx = self.tp_size * shard_size
+        # 分片起点必须由当前 rank 决定，而不是 world size。
+        # 如果这里误用 tp_size，那么 rank0 也不会从 0 开始取 shard，TP 权重一定整体错位。
+        start_idx = self.tp_rank * shard_size
         weight = weight.narrow(0, start_idx, shard_size)
         self.weight.data.copy_(weight)
 
@@ -89,7 +91,8 @@ class RowParallelLinear(LinearBase):
 
     def load_weight(self, weight: torch.Tensor, weight_name: str = None):
         shard_size = self.weight.data.size(1)   # 注意在我们真正实现Linear维度时,是output_size为第一维
-        start_idx = self.tp_size * shard_size
+        # RowParallelLinear 沿输入维切分，因此这里同样必须按 tp_rank 选择本 rank 负责的列分片。
+        start_idx = self.tp_rank * shard_size
         weight = weight.narrow(1, start_idx, shard_size)
         self.weight.data.copy_(weight)
 

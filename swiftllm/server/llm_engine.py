@@ -67,20 +67,19 @@ class LLMEngine:
         for p in self.ps:
             p.join()
     
-    def step(
+    def forward(
         self,
         input_ids_list: list[list[int]],
         seq_ids_list: list[int],
         decoding_seq_lens_list: list[int],
         ignore_kvcache: bool = False,
-    ) -> list[int]:
+    ) -> list[int] | None:
         """
         tensor parallel model forward
 
-        对标 model.forward: 参数和返回值都是一样的
+        这里对外暴露统一的 forward 接口，便于 offline 和 online 共享同一套调用面。
+        目前底层真正执行逻辑仍然在 ModelRunner.run() 中。
         """
-        # 利用主进程控制子进程执行forward
-        # 同时自己也要执行forward
         return self.model_runner.call(
             "run",
             input_ids_list,
@@ -88,5 +87,31 @@ class LLMEngine:
             decoding_seq_lens_list,
             ignore_kvcache,
         )
+
+    def step(
+        self,
+        input_ids_list: list[list[int]],
+        seq_ids_list: list[int],
+        decoding_seq_lens_list: list[int],
+        ignore_kvcache: bool = False,
+    ) -> list[int] | None:
+        """
+        兼容当前 offline 代码保留 step()，但统一转发到 forward()。
+        """
+        return self.forward(
+            input_ids_list,
+            seq_ids_list,
+            decoding_seq_lens_list,
+            ignore_kvcache,
+        )
+
+    def swap_in_seqs(self, seq_ids_list: list[int]):
+        return self.model_runner.call("swap_in_seqs", seq_ids_list)
+
+    def swap_out_seqs(self, seq_ids_list: list[int]):
+        return self.model_runner.call("swap_out_seqs", seq_ids_list)
+
+    def free_seqs_resources(self, seq_ids_list: list[int]):
+        return self.model_runner.call("free_seqs_resources", seq_ids_list)
 
 

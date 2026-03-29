@@ -32,7 +32,7 @@ if __name__ == '__main__':
         max_batch_size = 16,
         max_tokens_in_batch = 2048*16,
 
-        tensor_parallel_size = 1
+        tensor_parallel_size = 2
     )
 
     start_time = time.perf_counter()
