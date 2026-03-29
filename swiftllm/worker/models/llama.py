@@ -12,6 +12,7 @@ from swiftllm.worker.layers.layernorm import RMSNorm
 from swiftllm.worker.layers.attention import Attention
 from swiftllm.worker.kernels.silu_and_mul import silu_and_mul_inplace
 from swiftllm.worker.kernels.rotary_emb import rotary_embedding_inplace
+from swiftllm.worker.infer_state import InferState
 
 class LlamaMLP(nn.Module):
     def __init__(
@@ -101,7 +102,7 @@ class LlamaAttention(nn.Module):
         rotary_embedding_inplace(
             q,
             k,
-            get_inferstate()
+            InferState.get_inferstate()
         )
         o = self.attn(q, k, v, hidden_state)    # 因为后续 hidden_state 不会再被使用了, 所以为避免
                                                 # 在开辟空间的开销, 我们直接复用 hidden_state 的空间
