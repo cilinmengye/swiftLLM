@@ -5,9 +5,8 @@ from typing import AsyncGenerator
 import torch
 
 from swiftllm.engine_config import EngineConfig
-from swiftllm.model_config import LlamaModelConfig
-from swiftllm.worker.model import LlamaModel
-from swiftllm.utils import GB
+from swiftllm.worker.mconfigs.llamaconfig import LlamaModelConfig
+from swiftllm.server.llm_engine import LLMEngine
 
 from .tokenization_engine import TokenizationEngine
 from .structs import Request, RawRequest, StepOutput
@@ -45,24 +44,14 @@ class Engine:
     async def initialize(self):
         self.event_loop = asyncio.get_event_loop()
 
-        # print("[Engine] Initializing model...")
-        # self.model = LlamaModel(self.engine_config)
+        print("[Engine] Initializing model...")
+        self.model = LLMEngine(self.engine_config)
 
-        # print("[Engine] Loading weights...")
-        # self.model.load_weights()
-
-        # print("[Engine] Profiling kv blocks...")
-        # num_gpu_blocks = self.model.profile_num_blocks()
-        # num_cpu_blocks = self.engine_config.num_cpu_blocks
-        # block_size_bytes = self.engine_config.block_size*self.model_config.get_kvslot_size()
-        # print(f"[Engine] Number of GPU blocks: {num_gpu_blocks} ({num_gpu_blocks*block_size_bytes/GB:.2f} GB)")
-        # print(f"[Engine] Number of CPU blocks: {num_cpu_blocks} ({num_cpu_blocks*block_size_bytes/GB:.2f} GB)")
-
-        # print("[Engine] Allocating kv cache and swap...")
-        # self.model.init_kvcache_and_swap(num_gpu_blocks)
+        model_config = LlamaModelConfig.get_model_config
 
         print("[Engine] Initializing scheduler...")
-        self.scheduler = Scheduler(self.model, self.engine_config, num_gpu_blocks)
+        assert model_config.num_gpu_blocks > 0
+        self.scheduler = Scheduler(self.model, self.engine_config, model_config.num_gpu_blocks)
 
         print("[Engine] Initializing tokenization engine...")
         self.tokenization_engine = TokenizationEngine.remote(self.engine_config)

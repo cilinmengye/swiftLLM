@@ -46,9 +46,9 @@ import torch
 import triton
 import triton.language as tl
 
-from swiftllm.model_config import LlamaModelConfig
+from swiftllm.worker.mconfigs.llamaconfig import LlamaModelConfig
 from swiftllm.engine_config import EngineConfig
-from swiftllm.worker.infer_state import LlamaInferState
+from swiftllm.worker.infer_state import InferState
 
 # ==============================================================================
 # Phase 1: 局部注意力计算

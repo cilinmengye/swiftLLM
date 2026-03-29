@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from swiftllm.worker.infer_state import LlamaInferState
+from swiftllm.worker.infer_state import InferState
 
 @triton.jit
 def _fwd_rotary_embedding(
@@ -44,7 +44,7 @@ def _fwd_rotary_embedding(
 def rotary_embedding_inplace(
 	q: torch.Tensor,	# [num_tokens, num_q_heads, head_dim]
 	k: torch.Tensor,	# [num_tokens, num_k_heads, head_dim]
-	infer_state: LlamaInferState
+	infer_state: InferState
 ):
 	num_tokens = q.shape[0]
 	num_q_heads = q.shape[1]

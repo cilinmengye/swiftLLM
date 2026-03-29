@@ -1,59 +1,43 @@
-import itertools
+"""
+ModelInstance 负责如下任务:
+* model 初始化逻辑
+* model forward 逻辑, 包括 forward 前的预处理逻辑, forward 后善后逻辑
+* model 物理 GPU and CPU KV Cache
+* model swap KV Cache from GPU to CPU
+"""
 import math
-
+import itertools
 import torch
 import torch.distributed as dist
 
 from swiftllm.engine_config import EngineConfig
-from swiftllm.model_config import LlamaModelConfig
-from swiftllm.worker.weight import load_weights
+from swiftllm.worker.mconfigs.llamaconfig import LlamaModelConfig
+from swiftllm.worker.models.llama import LlamaForCausalLM
 from swiftllm.worker.block_manager import BlockManager
+from swiftllm.worker.loader import load_weight
+from swiftllm.worker.infer_state import InferState
 from swiftllm.utils import GB
 import swiftllm_c
 
-from .layers.pre_layer import LlamaPreLayer
-from .layers.transformer_layer import LlamaTransformerLayer
-from .layers.post_layer import LlamaPostLayer
-from .infer_state import LlamaInferState
-
-class LlamaModel:
-    """
-    LlamaModel - A Llama model that can be used for inference.
-
-    This class also acts as a "worker" that resides on a particular GPU, waiting
-    for the control plane (the scheduler) to send commands.
-
-    To initialize, please:
-    - call __init__()
-    - call load_weights()
-    - call profile_num_blocks() on one worker
-    - call init_kvcache_and_swap()
-    """
-
+class ModelInstance:
     @torch.inference_mode()
     def __init__(
         self,
-        engine_config: EngineConfig
-    ):
-        """
-        Initialize the LlamaModel.
-        """
-        self.engine_config = engine_config  # EngineConfig data class
+        engine_config: EngineConfig,
+        rank: int,
+    ):  
+        # Config
+        self.rank = rank
+        self.engine_config = engine_config
+        LlamaModelConfig.set_model_config(engine_config.model_path)
+        self.model_config = LlamaModelConfig.get_model_config()
 
-        # tensor parallel config
-        self.tp_size = dist.get_world_size()
-
-        # Load model config
-        self.model_config = LlamaModelConfig.load_from_model_path(engine_config.model_path)
-
-        # Weight and RoPE cache
-        self.weight = None
-        self._cos_cached = self._sin_cached = None
-
-        # Layers
-        self.pre_layer = None           # 包含 embedding token layer逻辑
-        self.transformer_layers = None  # 包含 Decoder layer逻辑
-        self.post_layer = None          # 包含 最后一次的 norm layer 和 lm_head, sampler 逻辑
+        # Initialize model
+        self.model = LlamaForCausalLM(self.model_config)
+        load_weight(self.model, self.engine_config.model_path)
+        
+        # Initialize rotary embeddings
+        self._cos_cached, self._sin_cached = self.model_config.get_rotary()
 
         # KV Cache
         self.num_blocks = None
@@ -62,37 +46,11 @@ class LlamaModel:
 
         # Block manager
         self.cpu_block_manager = self.gpu_block_manager = None
+
+        # Initialize KV Cache
+        num_gpu_blocks = self.profile_num_blocks()
+        self.init_kvcache_and_swap(num_gpu_blocks)
         
-    @torch.inference_mode()
-    def load_weights(self):
-        """
-        Load weights and initialize layers
-        """
-        # Load weights
-        self.weight = load_weights(
-            self.model_config,
-            torch.float16,
-            self.engine_config.model_path,
-            self.engine_config.use_dummy
-        )
-
-        # Initialize rotary embeddings
-        self._init_to_get_rotary()
-
-        # Initialize layers
-        decoding_piggyback_stream = torch.cuda.Stream()
-        self.pre_layer = LlamaPreLayer(self.model_config, self.weight)
-        self.transformer_layers = [
-            LlamaTransformerLayer(
-                self.model_config,
-                self.engine_config,
-                self.weight.layers[layer_id],
-                decoding_piggyback_stream,
-                layer_id
-            )
-            for layer_id in range(self.model_config.num_layers)
-        ]
-        self.post_layer = LlamaPostLayer(self.model_config, self.weight)
 
     @torch.inference_mode()
     def profile_num_blocks(self) -> int:
@@ -116,8 +74,12 @@ class LlamaModel:
             for input_len in input_lens
         ]
         seq_ids = list(range(batch_size))
-        print(f"[Model.profile] profile num block in batch size {batch_size} and input len {input_lens[0]}")
+
+        if self.rank == 0:
+            print(f"[Model.profile] profile num block in batch size {batch_size} and input len {input_lens[0]}")
+        
         self.k_cache = self.v_cache = None # pylint: disable=attribute-defined-outside-init
+
         _ = self.forward(input_ids, seq_ids, [], ignore_kvcache=True)
         torch.cuda.synchronize()
 
@@ -126,20 +88,31 @@ class LlamaModel:
         free_memory, total_memory = torch.cuda.mem_get_info()
         peak_memory = total_memory - free_memory
         useable_memory = total_memory*self.engine_config.gpu_mem_utilization
-        print(f"[Model.profile] GPU total memory: {total_memory/GB:.2f} GB, runtime peak memory: {peak_memory/GB:.2f} GB")
+
+        if self.rank == 0:
+            print(f"[Model.profile] GPU total memory: {total_memory/GB:.2f} GB, runtime peak memory: {peak_memory/GB:.2f} GB")
+        
         if useable_memory < peak_memory:
-            raise RuntimeError(f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB ({total_memory/GB:.2f} GB * {self.engine_config.gpu_mem_utilization})")
+            raise RuntimeError(f"[Model.profile rank {self.rank}] Peak memory {peak_memory/GB:.2f} GB exceeds usable memory " +
+                               f"{useable_memory/GB:.2f} GB ({total_memory/GB:.2f} GB * {self.engine_config.gpu_mem_utilization})")
+        
         block_size_bytes = self.engine_config.block_size * self.model_config.get_kvslot_size()
         num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
 
         target_num_blocks = [(input_len + self.engine_config.block_size - 1) // self.engine_config.block_size for input_len in input_lens]
-        print(f"[Model.profile] Available GPU block {num_gpu_blocks} " \
-              f"and least needed GPU block for batch size {batch_size}, input len {input_lens[0]} " \
-              f"is {sum(target_num_blocks)}")
+        
+        if self.rank == 0:
+            print(f"[Model.profile] Available GPU block {num_gpu_blocks} " \
+                  f"and least needed GPU block for batch size {batch_size}, input len {input_lens[0]} " \
+                  f"is {sum(target_num_blocks)}")
 
         torch.cuda.empty_cache()
+
+        # 注意我们在这里修改了model_config
+        self.model_config.num_gpu_blocks = num_gpu_blocks
         return num_gpu_blocks
-    
+
+
     @torch.inference_mode()
     def init_kvcache_and_swap(self, num_blocks: int):
         self.num_blocks = num_blocks
@@ -183,81 +156,8 @@ class LlamaModel:
             self.engine_config.max_blocks_per_seq,
             self.engine_config.block_size
         )
-
-    def _init_to_get_rotary(self):
-        rope_scaling = self.model_config.rope_scaling
-        base = self.model_config.rope_theta
-        max_position_embeddings = self.model_config.max_position_embeddings
-
-        # Handle the case where rope_scaling is a dictionary (Llama 3.2)
-        if isinstance(rope_scaling, dict):
-            scaling_factor = rope_scaling.get('factor', 4.0)
-            low_freq_factor = rope_scaling.get('low_freq_factor', 1.0)
-            high_freq_factor = rope_scaling.get('high_freq_factor', 1.0)
-            rope_type = rope_scaling.get('rope_type', 'llama3')
-            original_max_position_embeddings = rope_scaling.get('original_max_position_embeddings', max_position_embeddings)
-
-            # Calculate maximum sequence length based on scaling factor
-            max_seq_len = int(original_max_position_embeddings * scaling_factor)
-
-            # Generate position indices
-            dim = self.model_config.head_dim
-            t = torch.arange(max_seq_len + 128, device="cuda", dtype=torch.float32)
-
-            # Create frequency array with dimensions split between low and high frequency parts
-            dim_half = dim // 2
-            split_point = int(dim_half * low_freq_factor / (low_freq_factor + high_freq_factor))
-
-            # Apply different scaling factors to different parts of the frequency spectrum
-            inv_freq_low = 1.0 / (base ** (torch.arange(0, split_point * 2, 2, device="cuda", dtype=torch.float32) / dim))
-            inv_freq_high = 1.0 / (base ** (torch.arange(split_point * 2, dim, 2, device="cuda", dtype=torch.float32) / dim))
-
-            # Apply scaling factors
-            low_positions = t / low_freq_factor
-            high_positions = t / high_freq_factor
-
-            # Calculate frequencies for both parts
-            freqs_low = torch.outer(low_positions, inv_freq_low)
-            freqs_high = torch.outer(high_positions, inv_freq_high)
-
-            # Combine frequencies
-            freqs = torch.cat([freqs_low, freqs_high], dim=-1)
-        else:
-            # Original implementation for scalar rope_scaling
-            rope_scaling_factor = rope_scaling      # 标量，比如 1.0 或 2.0，表示支持扩展的序列长度的大小
-            max_seq_len = max_position_embeddings * rope_scaling_factor     # 支持的最大序列长度， max_position_embeddings 为原始预训练时支持的序列长度
-
-            inv_freq = 1.0 / (base ** (torch.arange(0, self.model_config.head_dim, 2, device="cuda", dtype=torch.float32) / self.model_config.head_dim))
-            t = torch.arange(max_seq_len + 128, device="cuda", dtype=torch.float32) / rope_scaling_factor       # t 决定缓存表实际有多少行（能覆盖多长的序列）， / rope_scaling_factor 目的是将长度缩放回原来的预训练序列长度
-            freqs = torch.outer(t, inv_freq)
-
-        self._cos_cached = torch.cos(freqs).to(torch.float16)
-        self._sin_cached = torch.sin(freqs).to(torch.float16)
-
-    @torch.inference_mode()
-    def _forward(
-        self,
-        input_ids: torch.Tensor,    # [total_token_num]
-        infer_state: LlamaInferState,
-    ) -> torch.Tensor:
-        """
-        Run a forward pass of the LlamaModel.
-        """
-        input_embds = self.pre_layer.forward(input_ids)
-        residual_buf = torch.zeros_like(input_embds)
-        for layer in self.transformer_layers:
-            input_embds = layer.forward(
-                input_embds,
-                residual_buf,
-                self.k_cache,
-                self.v_cache,
-                self.gpu_block_manager.block_table if not infer_state.ignore_kvcache else None,
-                infer_state,
-            )
-        input_embds += residual_buf
-        output_tokens = self.post_layer.forward(input_embds, infer_state)
-        return output_tokens
     
+
     @torch.inference_mode()
     def forward(
         self,
@@ -267,10 +167,9 @@ class LlamaModel:
         ignore_kvcache: bool = False,   # Skip actions related to kv cache, useful when profiling the number of kv blocks
     ) -> list[int]:
         """
-        Run a forward pass of the LlamaModel.
+        Run a forward pass of the Model.
 
-        This function is a wrapper of the `_forward` function. It prepares the infer_state
-        and calls the `_forward` function.
+        It prepares the infer_state and calls the model `forward` function.
 
         This function is intended to be called by the server.
         """
@@ -280,8 +179,10 @@ class LlamaModel:
 
         # 计算 Prefill（新请求）的数量
         num_prefill_seqs = len(input_ids_list) - len(decoding_seq_lens_list)
+        
         # 将每个请求在打平
         flattened_input_ids = list(itertools.chain(*input_ids_list))
+        
         # 汇总每个序列的长度：Prefill 算实际长度，Decoding 算当前已生成的长度
         seq_lengths_list = [len(seq) for seq in input_ids_list[:num_prefill_seqs]] + decoding_seq_lens_list
 
@@ -294,6 +195,7 @@ class LlamaModel:
         # 取出 Prefill request 长度
         prefill_seq_lens_list = seq_lengths_list[:num_prefill_seqs]
         prefill_seq_lens = torch.tensor(prefill_seq_lens_list, dtype=torch.int32, device="cuda")
+        
         # cumsum 是累加和，用来计算每个请求在打平后的 Tensor 中的起始位置
         prefill_start_locs = torch.cumsum(prefill_seq_lens, dim=0, dtype=torch.int32) - prefill_seq_lens
         max_prefill_len = max(prefill_seq_lens_list) if prefill_seq_lens_list else 0
@@ -359,7 +261,7 @@ class LlamaModel:
             max_decoding_len / (seq_block_size//2) <= 128:
             seq_block_size //= 2
 
-        infer_state = LlamaInferState(
+        InferState.set_inferstate(
             batch_size = batch_size,
             num_tokens = num_tokens,
 
@@ -386,13 +288,27 @@ class LlamaModel:
             position_cos = self._cos_cached[position_indices],
             position_sin = self._sin_cached[position_indices],
 
-            ignore_kvcache = ignore_kvcache
+            ignore_kvcache = ignore_kvcache,
+            k_cache = self.k_cache,
+            v_cache = self.v_cache,
+            gpu_block_table = self.gpu_block_manager.block_table if self.gpu_block_manager else None
         )
 
-        return self._forward(
-            torch.tensor(flattened_input_ids, dtype=torch.int32, device="cuda"),
-            infer_state
-        ).tolist()
+        # 调用 model forward
+        input_ids = torch.tensor(flattened_input_ids, dtype=torch.int32, device="cuda")
+        logits = self.model(input_ids)
+
+        # 执行采样算法
+        output_tokens = self.sampler(logits)
+        
+        return output_tokens
+
+    def sampler(self, logits: torch.Tensor) -> list[int]:
+        """
+        目前直接进行贪婪采样
+        """
+        output_tokens = torch.argmax(logits, dim=1)
+        return output_tokens.tolist()
 
     def _swap(
         self,

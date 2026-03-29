@@ -18,7 +18,7 @@ import atexit
 import torch.multiprocessing as mp
 
 from swiftllm.engine_config import EngineConfig
-from swiftLLM.swiftllm.worker.model_runner import ModelRunner
+from swiftllm.worker.model_runner import ModelRunner
 
 class LLMEngine:
     def __init__(

@@ -3,6 +3,7 @@ import argparse
 from transformers import AutoTokenizer
 
 import swiftllm
+from swiftllm.server.llm_engine import LLMEngine
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -29,18 +30,15 @@ if __name__ == '__main__':
 
         # The following are not used in the offline example
         max_batch_size = 16,
-        max_tokens_in_batch = 2048*16
+        max_tokens_in_batch = 2048*16,
+
+        tensor_parallel_size = 1
     )
 
     start_time = time.perf_counter()
 
     # Initialize the model
-    # For instructions on how to initialize the model, see comments in swiftllm/worker/model.py
-    model = swiftllm.LlamaModel(engine_config)
-    model.load_weights()
-    num_blocks = model.profile_num_blocks()
-    print("Number of blocks:", num_blocks)
-    model.init_kvcache_and_swap(num_blocks)
+    llm_engine = LLMEngine(engine_config=engine_config)
 
     model_creation_time = time.perf_counter() - start_time
     print(f"Model creation time: {model_creation_time:.2f} seconds")
@@ -59,7 +57,7 @@ if __name__ == '__main__':
     input_ids = tokenizer(prompts)['input_ids']
     # input_ids is list[list]
     # print(input_ids)
-    prompt_phase_outputs = model.forward(
+    prompt_phase_outputs = llm_engine.step(
         input_ids,
         list(range(0, len(prompts))),
         []
@@ -72,7 +70,7 @@ if __name__ == '__main__':
     for _ in range(20):
         for i, _ in enumerate(prompts):
             seq_lens[i] += 1
-        last_round_outputs = model.forward(
+        last_round_outputs = llm_engine.step(
             [[x] for x in last_round_outputs],
             list(range(0, len(prompts))),
             seq_lens

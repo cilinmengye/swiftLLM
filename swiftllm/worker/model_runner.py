@@ -8,8 +8,8 @@ import torch
 import pickle
 
 from swiftllm.engine_config import EngineConfig
-from swiftllm.model_config import LlamaModelConfig
-from swiftllm.worker.model import LlamaModel
+from swiftllm.worker.mconfigs.llamaconfig import LlamaModelConfig
+from swiftllm.worker.model_instance import ModelInstance
 from swiftllm.utils import GB
 
 class ModelRunner:
@@ -33,7 +33,20 @@ class ModelRunner:
         """
         # 我们需要在此做得工作有: 1. 初始化GPU通信组 
         # 2. 初始化模型  3. 初始化多进程之间通信
-        self.engine_config = engine_config
+        # 显示设置让全部多进程都能看见全局的engine_config
+        EngineConfig.set_engine_config(
+            model_path=engine_config.model_path,
+            use_dummy=engine_config.use_dummy,
+            block_size=engine_config.block_size,
+            gpu_mem_utilization=engine_config.gpu_mem_utilization,
+            num_cpu_blocks=engine_config.num_cpu_blocks,
+            max_seqs_in_block_table=engine_config.max_seqs_in_block_table,
+            max_blocks_per_seq=engine_config.max_blocks_per_seq,
+            max_batch_size=engine_config.max_batch_size,
+            max_tokens_in_batch=engine_config.max_tokens_in_batch,
+            tensor_parallel_size=engine_config.tensor_parallel_size,
+        )
+        self.engine_config = EngineConfig.get_engine_config()
         self.rank = rank
         self.event = event
         self.world_size = engine_config.tensor_parallel_size
@@ -45,38 +58,19 @@ class ModelRunner:
             world_size=self.world_size, 
             rank=rank,
         )
+        
         # 创建映射,这意味着 process rank i
         # -> GPU cuda: i, 即此进程绑定了
         # 指定cuda rank的GPU
         torch.cuda.set_device(rank)
+        torch.set_default_device("cuda")    # 接下来的tensor默认全部在GPU上
 
         # 2. 初始化模型
         # 为防止多进程打印内容出现混乱，我们
         # 规定只允许rank == 0主进程打印信息
-        self.model_config = LlamaModelConfig.load_from_model_path(engine_config.model_path)
-
-        if rank == 0:
-            print("[Engine] Initializing model...")
-        self.model = LlamaModel(self.engine_config)
-
-        if rank == 0:
-            print("[Engine] Loading weights...")
-        self.model.load_weights()
-
-        if rank == 0:
-            print("[Engine] Profiling kv blocks...")
-        num_gpu_blocks = self.model.profile_num_blocks()
-        self.num_gpu_blocks = num_gpu_blocks
-
-        num_cpu_blocks = self.engine_config.num_cpu_blocks
-        block_size_bytes = self.engine_config.block_size*self.model_config.get_kvslot_size()
-        if rank == 0:
-            print(f"[Engine] Number of GPU blocks Per GPU: {num_gpu_blocks} ({num_gpu_blocks*block_size_bytes/GB:.2f} GB)")
-            print(f"[Engine] Number of CPU blocks Per Process: {num_cpu_blocks} ({num_cpu_blocks*block_size_bytes/GB:.2f} GB)")
-
-        if rank == 0:
-            print("[Engine] Allocating kv cache and swap...")
-        self.model.init_kvcache_and_swap(num_gpu_blocks)
+        self.modelinstance = ModelInstance(self.engine_config, rank)
+        
+        torch.set_default_device("cpu")     # 模型初始化结束后，tensor默认在CPU上
 
         # 3. 初始化多进程之间通信
         if self.world_size > 1:
@@ -101,7 +95,7 @@ class ModelRunner:
         decoding_seq_lens_list: list[int],
         ignore_kvcache: bool = False,
     ) -> list[int]:
-        return self.model.forward(
+        return self.modelinstance.forward(
             input_ids_list=input_ids_list,
             seq_ids_list=seq_ids_list,
             decoding_seq_lens_list=decoding_seq_lens_list,
@@ -160,9 +154,6 @@ class ModelRunner:
         self.shm.buf[4: n + 4] = data
         for event in self.event:    # 生产者生产完毕, 让消费者开始消费
             event.set()
-
-    def get_num_gpu_blocks(self):
-        return self.num_gpu_blocks
 
 
 

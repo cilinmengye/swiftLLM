@@ -1,6 +1,6 @@
 from collections import deque
 
-from swiftllm.model_config import LlamaModelConfig
+from swiftllm.worker.mconfigs.llamaconfig import LlamaModelConfig
 from swiftllm.engine_config import EngineConfig
 from swiftllm.utils import cdiv
 from swiftllm.server.structs import Request

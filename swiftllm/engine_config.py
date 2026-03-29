@@ -1,6 +1,8 @@
 import dataclasses
 import argparse
 
+_ENGINECONFIG = None
+
 @dataclasses.dataclass
 class EngineConfig:
     """
@@ -94,3 +96,46 @@ class EngineConfig:
             default=1,
             help="Model tensor parallel size",
         )
+    
+    @staticmethod
+    def set_engine_config(
+        model_path: str,
+        use_dummy: bool = False,
+        block_size: int = 16,
+        gpu_mem_utilization: float = 0.97,
+        num_cpu_blocks: int = 2048,
+        max_seqs_in_block_table: int = 4096,
+        max_blocks_per_seq: int = 32768,
+        max_batch_size: int = 512,
+        max_tokens_in_batch: int = 32768,
+        tensor_parallel_size: int = 1,
+    ):
+        """
+        Initialize the global engine config from explicit arguments.
+
+        Returns:
+            EngineConfig: the initialized global config
+        """
+        global _ENGINECONFIG
+        
+        if _ENGINECONFIG is not None:
+            _ENGINECONFIG = None
+
+        _ENGINECONFIG = EngineConfig(
+            model_path=model_path,
+            use_dummy=use_dummy,
+            block_size=block_size,
+            gpu_mem_utilization=gpu_mem_utilization,
+            num_cpu_blocks=num_cpu_blocks,
+            max_seqs_in_block_table=max_seqs_in_block_table,
+            max_blocks_per_seq=max_blocks_per_seq,
+            max_batch_size=max_batch_size,
+            max_tokens_in_batch=max_tokens_in_batch,
+            tensor_parallel_size=tensor_parallel_size,
+        )
+        return _ENGINECONFIG
+
+    @staticmethod
+    def get_engine_config():
+        assert _ENGINECONFIG is not None
+        return _ENGINECONFIG

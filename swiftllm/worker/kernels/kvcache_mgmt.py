@@ -2,9 +2,9 @@ import torch
 import triton
 import triton.language as tl
 
-from swiftllm.model_config import LlamaModelConfig
+from swiftllm.worker.mconfigs.llamaconfig import LlamaModelConfig
 from swiftllm.engine_config import EngineConfig
-from swiftllm.worker.infer_state import LlamaInferState
+from swiftllm.worker.infer_state import InferState
 from swiftllm.utils import cdiv
 
 @triton.jit
@@ -86,7 +86,7 @@ def store_kvcache(
     block_table: torch.Tensor,
     model_config: LlamaModelConfig,
     engine_config: EngineConfig,
-    infer_state: LlamaInferState,
+    infer_state: InferState,
     cur_layer: int
 ):
     assert k.is_contiguous()
