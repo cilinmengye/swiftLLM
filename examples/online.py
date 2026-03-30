@@ -44,9 +44,15 @@ async def main():
         help="Use streaming mode",
         action="store_true"
     )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type = int, 
+        required=True
+    )
     args = parser.parse_args()
     model_path = args.model_path
     is_streaming_mode = args.streaming
+    tensor_parallel_size = args.tensor_parallel_size
 
     engine_config = swiftllm.EngineConfig(
         model_path = model_path,
@@ -59,7 +65,9 @@ async def main():
         max_blocks_per_seq = 3072,
 
         max_batch_size = 4,
-        max_tokens_in_batch = 1024
+        max_tokens_in_batch = 1024,
+
+        tensor_parallel_size = tensor_parallel_size
     )
 
     prompt_and_output_lens = [

@@ -89,7 +89,8 @@ class LlamaAttention(nn.Module):
             f"model.layers.{self.layer_id}.self_attn.v_proj.weight": self.qkv_proj,
             f"model.layers.{self.layer_id}.self_attn.o_proj.weight": self.o_proj,
         }
-    
+
+
     def forward(
         self,
         hidden_state: torch.Tensor
@@ -97,7 +98,9 @@ class LlamaAttention(nn.Module):
         qkv = self.qkv_proj(hidden_state)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # Problem 2 的根因在这里：
+        # hidden_state不再使用, 提前释放资源
+        hidden_state = None
+
         # 当前新版为了减少 GEMM / kernel launch，把 q_proj、k_proj、v_proj 合并成了
         # 一次 fused QKV projection；但 split() 返回的是原始 qkv 大张量上的 view。
         # 这意味着后面的 q/k/v 虽然 shape 已经被解释成 [tokens, heads, head_dim]，
@@ -107,27 +110,29 @@ class LlamaAttention(nn.Module):
         # 下游两个路径都仍然依赖这个旧契约：
         # 1. store_kvcache() 要求 k / v.is_contiguous()；
         # 2. paged_attention() 要求 q.is_contiguous()。
-        #
-        # 因此这里不能只修 k / v，否则 decode 阶段仍可能在 q 上再次失败。
-        # 这次采取的策略是：保留 fused QKV 架构不动，只在 attention 的边界处把
-        # q / k / v 一次性收口成连续张量，让现有 Triton kernel 契约继续成立。
-        # 这不是长期唯一方案，但它是当前最小、最稳妥的 correctness 修复。
         q = q.view(-1, self.num_heads, self.head_dim).contiguous()
         k = k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
-        v = v.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+        v = v.view(-1, self.num_kv_heads, self.head_dim).contiguous()        
         rotary_embedding_inplace(
             q,
             k,
             InferState.get_inferstate()
         )
-        o = self.attn(q, k, v, hidden_state)    # 因为后续 hidden_state 不会再被使用了, 所以为避免
-                                                # 在开辟空间的开销, 我们直接复用 hidden_state 的空间
+        # attention 子层在 TP 下拿到的 q / k / v 都已经只是当前 rank 的 local heads，
+        # 因而它在 o_proj 之前产出的中间结果，也只能是 [total_num_tokens, local_hidden_size]
+        # local_hidden_size == self.num_head * self.head_dim != hidden_size
+        #
+        # 所以这里不能继续像旧版那样把 full hidden width 的 hidden_state 传进去当输出
+        # 正确的边界是：
+        # 1. self.attn(q, k, v) 只返回当前 rank 的 local attention 输出；
+        # 2. self.o_proj(RowParallelLinear) 再把 local hidden shard 聚合回 full hidden。
+        attn_out_local = self.attn(q, k, v)
         # 释放资源
         q = None
         k = None
         v = None
 
-        output = self.o_proj(o)
+        output = self.o_proj(attn_out_local)
         return output
 
 class LlamaDecoderLayer(nn.Module):

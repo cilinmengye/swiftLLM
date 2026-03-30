@@ -515,16 +515,15 @@ def _fwd_paged_attention_phase2(
 # ==============================================================================
  
 def paged_attention(
-    q: torch.Tensor,        # [num_decoding_seqs, num_q_heads, head_dim]，例 [2, 4, 64]
-    k_cache: torch.Tensor,  # [num_total_blocks, num_layers, num_kv_heads, block_size, head_dim]
+    q: torch.Tensor,        # [num_decoding_seqs, local_num_q_heads, head_dim]
+    k_cache: torch.Tensor,  # [num_total_blocks, num_layers, local_num_kv_heads, block_size, head_dim]
     v_cache: torch.Tensor,  # 同上
     block_table: torch.Tensor,  # [num_seqs_in_engine, max_blocks_per_seq]
-    model_config,           # 含 num_q_heads, num_kv_heads, head_dim, num_layers
-    engine_config,          # 含 block_size, max_blocks_per_seq
-    infer_state,            # 含 num_decoding_seqs, num_seq_blocks, seq_block_size,
-                            #     softmax_scale, decoding_seq_lens, seq_ids, num_prefill_seqs
-    cur_layer: int,         # 当前 Transformer 层号
-    o: torch.Tensor         # [num_decoding_seqs, num_q_heads, head_dim]，存放输出
+    model_config,
+    engine_config,
+    infer_state,
+    cur_layer: int,
+    o: torch.Tensor         # [num_decoding_seqs, local_num_q_heads * head_dim]，存放当前 rank 的 local 输出
 ):
     # --------------------------------------------------------------------------
     # 1. 基本断言：确保所有张量是连续内存（Triton kernel 要求）
@@ -534,95 +533,94 @@ def paged_attention(
     assert v_cache.is_contiguous()
     assert block_table.is_contiguous()
     assert infer_state.seq_block_size % engine_config.block_size == 0
-    # seq_block_size 必须是 block_size 的整数倍，确保 seq_block 边界与物理块边界对齐
-    # 例: seq_block_size=8, block_size=4 → 8%4=0 ✓
     assert o.is_contiguous()
+
+    # decode 路径也已经运行在 TP local shard 语义下。
+    # 因此这里绝不能继续用 model_config.num_q_heads / num_kv_heads 这两个“全局 head
+    # 数”去解释 q 与 KV cache，否则 kernel 会按 full tensor 的 stride 去读写当前 rank
+    # 的 local shard，shape 即使勉强对上，语义也已经错了。
+    #
+    # 正确做法是以运行时张量 shape 为准：
+    # 1. q.shape[1] 给出当前 rank 的 local_num_q_heads；
+    # 2. k_cache.shape[2] / v_cache.shape[2] 给出当前 rank 的 local_num_kv_heads；
+    # 3. o 仍然只是 local attention 输出，真正回到 full hidden 要等上层 o_proj。
+    local_num_q_heads = q.shape[1]
+    local_num_kv_heads = k_cache.shape[2]
+    head_dim = q.shape[2]
+    assert q.shape[0] == infer_state.num_decoding_seqs
+    assert v_cache.shape[2] == local_num_kv_heads
+    assert k_cache.shape[4] == head_dim
+    assert v_cache.shape[4] == head_dim
+    assert head_dim == model_config.head_dim
+    assert local_num_q_heads % local_num_kv_heads == 0
+    assert o.shape == (infer_state.num_decoding_seqs, local_num_q_heads * head_dim)
 
     # --------------------------------------------------------------------------
     # 2. 分配 Phase 1 的中间输出缓冲区
     # --------------------------------------------------------------------------
     mid_o = torch.empty((
-        infer_state.num_decoding_seqs,  # 2
-        model_config.num_q_heads,        # 4
-        infer_state.num_seq_blocks,      # 2
-        model_config.head_dim            # 64
+        infer_state.num_decoding_seqs,
+        local_num_q_heads,
+        infer_state.num_seq_blocks,
+        head_dim
     ), device=q.device, dtype=torch.float32)
-    # shape: [2, 4, 2, 64]，float32 保证中间计算精度
- 
+
     mid_o_logexpsum = torch.empty((
-        infer_state.num_decoding_seqs,  # 2
-        model_config.num_q_heads,        # 4
-        infer_state.num_seq_blocks       # 2
+        infer_state.num_decoding_seqs,
+        local_num_q_heads,
+        infer_state.num_seq_blocks
     ), device=q.device, dtype=torch.float32)
-    # shape: [2, 4, 2]，每个值是对应 seq_block 的 log2(sum_exp)
 
     # --------------------------------------------------------------------------
     # 3. 启动 Phase 1
     # --------------------------------------------------------------------------
-    grid = (infer_state.num_decoding_seqs,   # 2：沿序列维度并行
-            model_config.num_q_heads,         # 4：沿 Q head 维度并行
-            infer_state.num_seq_blocks)        # 2：沿 seq_block 维度并行
-    # 共 2×4×2=16 个 Triton kernel 实例同时运行
- 
+    grid = (infer_state.num_decoding_seqs,
+            local_num_q_heads,
+            infer_state.num_seq_blocks)
+
     _fwd_paged_attention_phase1[grid](
         mid_o, mid_o_logexpsum,
         q, k_cache, v_cache,
         block_table,
- 
-        # softmax_scale 预乘 log2(e) = 1.442695...
-        # 原因：
-        #   1. NVIDIA GPU 没有原生 exp 指令，exp 实际通过 x*log2(e) → exp2 实现
-        #      预乘后直接用 exp2，省去每次运行时的乘法
-        #   2. Triton 在循环内使用 exp 时有优化 bug（见 triton-lang/triton#2961）
-        #      用 exp2 可以绕开此 bug
-        # 例: original scale = 1/sqrt(64) = 0.125
-        #     传入值 = 0.125 * 1.442695 ≈ 0.1803
+
         infer_state.softmax_scale * 1.442695040888963,
- 
-        infer_state.decoding_seq_lens,      # [2, 6]
- 
+
+        infer_state.decoding_seq_lens,
+
         infer_state.seq_ids[infer_state.num_prefill_seqs:],
-        # 只取解码序列的 seq_ids（跳过 prefill 序列）
-        # 假设 num_prefill_seqs=1，seq_ids=[1,3,7]，则取 [3,7]
- 
-        infer_state.num_seq_blocks,         # 2
-        cur_layer,                          # 例: 15
- 
-        model_config.num_layers,            # 32
-        model_config.num_q_heads,           # 4
-        model_config.num_kv_heads,          # 2
-        model_config.num_q_heads // model_config.num_kv_heads,  # 2（GQA ratio）
-        engine_config.block_size,           # 4
-        model_config.head_dim,              # 64
-        infer_state.seq_block_size,         # 8
-        engine_config.max_blocks_per_seq,   # 3
- 
+
+        infer_state.num_seq_blocks,
+        cur_layer,
+
+        model_config.num_layers,
+        local_num_q_heads,
+        local_num_kv_heads,
+        local_num_q_heads // local_num_kv_heads,
+        engine_config.block_size,
+        head_dim,
+        infer_state.seq_block_size,
+        engine_config.max_blocks_per_seq,
+
         num_warps=1,
-        # 每个 SM 内只用 1 个 warp（32 线程）
-        # 原因：head_dim=64 或 128 时，数据量不大，更多 warp 会导致寄存器竞争
-        # 对于大 head_dim（如 256），可能需要调整
- 
+
         num_stages=4,
-        # 流水线深度：4 个 stage 异步预取，隐藏内存延迟
-        # Triton 会自动将下一次迭代的 load 与本次迭代的计算重叠
     )
 
- 
+
     # --------------------------------------------------------------------------
     # 4. 启动 Phase 2
     # --------------------------------------------------------------------------
-    grid = (infer_state.num_decoding_seqs,  # 2
-            model_config.num_q_heads)        # 4
-    # 共 2×4=8 个 kernel，每个合并一个 (序列, Q head) 的全部 seq_block
- 
+    grid = (infer_state.num_decoding_seqs,
+            local_num_q_heads)
+
     _fwd_paged_attention_phase2[grid](
         mid_o, mid_o_logexpsum,
         o,
         infer_state.decoding_seq_lens,
-        model_config.num_q_heads,       # 4
-        model_config.head_dim,          # 64
-        infer_state.num_seq_blocks,     # 2
-        infer_state.seq_block_size,     # 8
+        local_num_q_heads,
+        head_dim,
+        infer_state.num_seq_blocks,
+        infer_state.seq_block_size,
     )
     # Phase 2 结束后，o 中存放了所有解码序列的最终 attention 输出
     # shape: [num_decoding_seqs, num_q_heads, head_dim] = [2, 4, 64]

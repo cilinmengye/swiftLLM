@@ -97,6 +97,21 @@ def store_kvcache(
     assert infer_state.seq_ids.is_contiguous()
     assert infer_state.decoding_seq_lens.is_contiguous()
 
+    # 当前 rank 传进来的 k / v 已经只包含 local_num_kv_heads；因此这里不能继续使用
+    # model_config.num_kv_heads 这个“全局 head 数”去解释它们，否则 Triton kernel 在
+    # 计算 stride 时就会把 local shard 当成 full tensor 来跨行寻址，直接读错输入。
+    #
+    # 同理，当前 rank 持有的 k_cache / v_cache 也应当只为本 rank 的 local KV heads
+    # 分配空间。只有这样，kernel 内部使用 local_num_kv_heads 计算出的线性地址，才能与
+    # cache 的实际内存布局保持一致。
+    local_num_kv_heads = k.shape[1]
+    head_dim = k.shape[2]
+    assert v.shape[1] == local_num_kv_heads
+    assert v.shape[2] == head_dim
+    assert k_cache.shape[2] == local_num_kv_heads
+    assert v_cache.shape[2] == local_num_kv_heads
+    assert head_dim == model_config.head_dim
+
     if infer_state.num_prefill_seqs > 0:
         grid = (infer_state.num_prefill_seqs, cdiv(infer_state.max_prefill_len, engine_config.block_size))
         _fwd_kvcache_mgmt_prefill_kernel[grid](
@@ -105,7 +120,7 @@ def store_kvcache(
             block_table,
             infer_state.seq_ids, infer_state.prefill_seq_start_locs, infer_state.prefill_seq_lens,
             cur_layer,
-            model_config.num_layers, model_config.num_kv_heads, engine_config.block_size, model_config.head_dim, engine_config.max_blocks_per_seq
+            model_config.num_layers, local_num_kv_heads, engine_config.block_size, head_dim, engine_config.max_blocks_per_seq
         )
 
     if infer_state.num_decoding_seqs > 0:
@@ -118,7 +133,7 @@ def store_kvcache(
             infer_state.seq_ids[infer_state.num_prefill_seqs:],
             infer_state.decoding_seq_lens,
             cur_layer,
-            model_config.num_layers, model_config.num_kv_heads, engine_config.block_size, model_config.head_dim, engine_config.max_blocks_per_seq
+            model_config.num_layers, local_num_kv_heads, engine_config.block_size, head_dim, engine_config.max_blocks_per_seq
         )
 
         # for my_batch_id in range(infer_state.num_decoding_seqs):

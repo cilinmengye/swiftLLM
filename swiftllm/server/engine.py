@@ -57,7 +57,7 @@ class Engine:
         self.tokenization_engine = TokenizationEngine.remote(self.engine_config)
         self.eos_token_id = await self.tokenization_engine.get_eos_token_id.remote()
 
-        print("[Engine] Model initialized")
+        print("[Engine] Engine initialized")
         self.initialized = True
 
     async def add_request_and_stream(self, raw_request: RawRequest) -> AsyncGenerator[StepOutput, None]:

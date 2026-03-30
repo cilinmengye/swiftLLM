@@ -42,9 +42,16 @@ def silu_and_mul_inplace(
 ):
     assert x.is_contiguous()
     num_tokens = x.shape[0]
+    assert x.shape[1] % 2 == 0
     ffn_inter_dim = x.shape[1] // 2
 
+    # TODO: 在llama 2模型中这里会有个性能问题，因为 llama 2的 ffn_inter_dim
+    # 在TP并行下，有时并不能够整除 block size = 256, 只好减小 block_size
+    # 的大小
     block_size = 256
+    while ffn_inter_dim % block_size != 0 and block_size > 0:
+        block_size = block_size // 2
+    assert block_size > 0
     assert ffn_inter_dim % block_size == 0
     _fwd_silu_and_mul[(num_tokens, ffn_inter_dim // block_size)](
         x, ffn_inter_dim, block_size

@@ -36,6 +36,13 @@ class ModelInstance:
         self.model = LlamaForCausalLM(self.model_config)
         load_weight(self.model, self.engine_config.model_path)
         
+        # KV cache 在 TP 下同样是按 head 维切分的。
+        # 也就是说，每个 rank 只会持有当前 rank 的 local KV heads，而不是完整的
+        # global num_kv_heads。这个 local head 数应与 attention / store_kvcache /
+        # paged_attention 的运行时 contract 保持一致，否则 cache 的真实内存布局与
+        # Triton kernel 用来计算 stride 的 head 数就会错位。
+        self.local_num_kv_heads = self.model.model.layers[0].self_attn.num_kv_heads
+
         # Initialize rotary embeddings
         self._cos_cached, self._sin_cached = self.model_config.get_rotary()
 
@@ -96,7 +103,14 @@ class ModelInstance:
             raise RuntimeError(f"[Model.profile rank {self.rank}] Peak memory {peak_memory/GB:.2f} GB exceeds usable memory " +
                                f"{useable_memory/GB:.2f} GB ({total_memory/GB:.2f} GB * {self.engine_config.gpu_mem_utilization})")
         
-        block_size_bytes = self.engine_config.block_size * self.model_config.get_kvslot_size()
+        # 这里估算的是“每个 GPU rank 上一个逻辑 block 需要占用多少字节”。
+        # 在 TP 下，单个 rank 只保存 local KV shard，因此不能再直接使用
+        # model_config.get_kvslot_size() 里的全局 num_kv_heads；否则会把每个 block 的
+        # 开销高估 tp_size 倍，进而错误低估可分配的 GPU block 数。
+        block_size_bytes = self.engine_config.block_size * (
+            2 * self.model_config.num_layers * self.local_num_kv_heads * self.model_config.head_dim
+            * torch.float16.itemsize
+        )
         num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
 
         target_num_blocks = [(input_len + self.engine_config.block_size - 1) // self.engine_config.block_size for input_len in input_lens]
@@ -121,7 +135,7 @@ class ModelInstance:
         kvcache_shape = (
             self.num_blocks,
             self.model_config.num_layers,
-            self.model_config.num_kv_heads,
+            self.local_num_kv_heads,
             self.engine_config.block_size,
             self.model_config.head_dim
         )
@@ -134,7 +148,7 @@ class ModelInstance:
         kvswap_shape = (
             self.engine_config.num_cpu_blocks,
             self.model_config.num_layers,
-            self.model_config.num_kv_heads,
+            self.local_num_kv_heads,
             self.engine_config.block_size,
             self.model_config.head_dim
         )
