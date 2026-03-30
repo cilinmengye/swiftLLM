@@ -5,23 +5,27 @@ import torch
 from vllm import LLM, SamplingParams
 
 # Sample prompts.
-# prompts = [
-#     "Hello, my name is",
-#     "The president of the United States is",
-#     "The capital of France is",
-#     "The future of AI is",
-# ]
-input_ids_batch = [
-    [46811, 76003, 59779, 84592, 118852],
-    [93606, 16554, 91671, 111009],
-]
-
 prompts = [
-    {"prompt_token_ids": ids}
-    for ids in input_ids_batch
+   "Life blooms like a flower, far away",
+   "one two three four five",
+   "A B C D E F G H I J K L M N O P Q R S T U V",
+   "To be or not to be,",
 ]
+# input_ids_batch = [
+#     [46811, 76003, 59779, 84592, 118852],
+#     [93606, 16554, 91671, 111009],
+# ]
+
+# prompts = [
+#     {"prompt_token_ids": ids}
+#     for ids in input_ids_batch
+# ]
 # Create a sampling params object.
-sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+sampling_params = SamplingParams(
+    temperature=0, 
+    n=1,
+    max_tokens = 100,
+)
 
 
 def main():

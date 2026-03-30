@@ -71,10 +71,10 @@ async def main():
     )
 
     prompt_and_output_lens = [
-        ("Life blooms like a flower, far away", 10),
-        ("one two three four five", 50),
-        ("A B C D E F G H I J K L M N O P Q R S T U V", 5),
-        ("To be or not to be,", 15),
+        ("Life blooms like a flower, far away", 100),
+        ("one two three four five", 100),
+        ("A B C D E F G H I J K L M N O P Q R S T U V", 100),
+        ("To be or not to be,", 100),
     ]
 
     engine = swiftllm.Engine(engine_config)
